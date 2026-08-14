@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+
+# Local MODFLOW/CFP outputs if a developer runs models outside the app's temp workspace
+*.hds
+*.hed
+*.head
+*.cbc
+*.list
+*.lst
+*.bud
+*.cbb

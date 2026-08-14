@@ -1,0 +1,11 @@
+# Use Python 3.11 when deploying on Streamlit Community Cloud.
+streamlit==1.60.0
+
+# CFPy source pinned to the maintained TU Dresden repository for reproducibility.
+CFPy-TUD @ git+https://github.com/iGW-TU-Dresden/CFPy.git@f36e0cbdb69e4214812fc5138ec170fc17cfac63
+
+# Direct imports used by the app (CFPy also depends on these).
+flopy>=3.3.3,<4
+numpy>=1.26.4,<2.7
+pandas>=1.2.1,<3
+matplotlib>=3.3.4,<4
