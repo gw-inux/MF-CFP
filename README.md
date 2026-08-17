@@ -19,16 +19,6 @@ karst-spring-response/
 
 CFPy is installed from the public TU Dresden GitHub repository at a pinned commit. Do not copy a second CFPy installation into this repository unless you intentionally want to develop CFPy and the Streamlit app together.
 
-## Streamlit Community Cloud deployment
-
-1. Create a new GitHub repository, for example `gwp-karst-spring-response`.
-2. Copy all files and folders from this package into the repository root. Keep `CFPv2` inside `bin/`.
-3. Commit and push the repository to GitHub.
-4. In Streamlit Community Cloud, choose **Create app** and select the new repository.
-5. Use branch `main` and entrypoint `streamlit_app.py`.
-6. Open **Advanced settings** and select **Python 3.11**. CFPy currently declares support for Python >=3.9 and <3.12.
-7. Deploy the app. No `packages.txt` is required for the supplied CFPv2 Linux build.
-
 ## Local Linux test
 
 Create a Python 3.11 virtual environment, install dependencies, and run the smoke test:
