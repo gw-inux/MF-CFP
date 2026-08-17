@@ -3789,7 +3789,7 @@ with c1:
         "Conduit diameter, d [m]",
         min_value=0.02,
         max_value=1.00,
-        value=0.10,
+        value=0.30,
         step=0.01,
     )
     trtst = st.slider(
@@ -3805,12 +3805,12 @@ with c2:
         "Roughness height [m]",
         min_value=0.0,
         max_value=0.20,
-        value=0.10,
+        value=0.03,
         step=0.005,
     )
     cfptemp = st.slider(
         "Water temperature [°C]",
-        min_value=0.0,
+        min_value=5.0,
         max_value=30.0,
         value=10.0,
         step=1.0,
