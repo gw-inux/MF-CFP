@@ -21,7 +21,53 @@ import flopy.utils.binaryfile as bf
 
 
 # =============================================================================
-# Configuration
+# SOURCE-CODE STRUCTURE / TABLE OF CONTENTS
+# =============================================================================
+# Line numbers below refer to this v16 file. Regenerate this overview after
+# structural edits that add, remove, or move source-code blocks.
+#
+# 0. Application configuration .................................. line 70
+# 1. Model ...................................................... line 121
+#   1.1 Runtime environment and model files ..................... line 124
+#   1.2 Time discretization helper .............................. line 241
+#   1.3 MODFLOW + CFP model design and execution ................ line 255
+#     1.3.1 Initialize MODFLOW/CFP .............................. line 282
+#     1.3.2 Continuum characteristics ........................... line 291
+#     1.3.3 Time discretization ................................. line 319
+#     1.3.4 Boundary and initial conditions ..................... line 338
+#     1.3.5 MODFLOW packages .................................... line 352
+#     1.3.6 CFP solver variables ................................ line 419
+#     1.3.7 CFP conduit-network construction .................... line 428
+#     1.3.8 CFP pipe data ....................................... line 456
+#     1.3.9 CFP node and exchange data .......................... line 476
+#     1.3.10 CFP package and input files ........................ line 490
+#     1.3.11 Execute CFP/MODFLOW ................................ line 550
+#     1.3.12 External conduit boundary fluxes ................... line 561
+#     1.3.13 Cumulative whole-run water budget .................. line 623
+#     1.3.14 Head and flow diagnostics .......................... line 637
+# 2. Model output and post-processing ........................... line 678
+#   2.1 Cumulative water-budget parsing ......................... line 681
+#   2.2 CFP listing-file parsing ................................ line 809
+#   2.3 MODFLOW matrix-head output and diagnostic assembly ...... line 1157
+# 3. User input, run state, and diagnostic selection ............ line 1284
+#   3.1 Synchronized numerical-input helpers .................... line 1287
+#   3.2 Stored-run data and rolling history ..................... line 1574
+#   3.3 Diagnostic node/tube selection and geometry ............. line 1686
+# 4. Plotting and diagnostic visualization ...................... line 1782
+#   4.1 Common plotting, scale, and formatting helpers .......... line 1785
+#   4.2 Spring-response comparison .............................. line 2025
+#   4.3 Head diagnostics ........................................ line 2069
+#   4.4 Flow diagnostics ........................................ line 2575
+#   4.5 Cumulative water-budget plots ........................... line 3114
+# 5. Streamlit user interface ................................... line 3214
+#   5.1 Session-state initialization and migration .............. line 3217
+#   5.2 Model setup, parameter inputs, and model execution ...... line 3269
+#   5.3 Current result and optional diagnostics ................. line 3618
+#   5.4 Stored-run comparison ................................... line 4311
+
+
+# =============================================================================
+# 0. APPLICATION CONFIGURATION
 # =============================================================================
 # Page configuration is intentionally not set here. This keeps the file easy to
 # integrate later as a page in a larger multipage Streamlit application. Put
@@ -54,10 +100,6 @@ FLOW_RESULTS_MARKER = "RESULTS OF FLOW CALCULATION"
 
 # Generic Fortran/decimal number pattern. D exponents are converted to E later.
 _NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?"
-_NODE_RESULT_RE = re.compile(
-    rf"^\s*(\d+)\s+({_NUMBER})\s+(?:FIX\s+)?({_NUMBER})\s+({_NUMBER})(?:\s|$)",
-    re.IGNORECASE,
-)
 _TUBE_RESULT_RE = re.compile(
     rf"^\s*(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+({_NUMBER})(?:\s|$)",
     re.IGNORECASE,
@@ -73,12 +115,14 @@ _STRESS_TIME_RE = re.compile(
 )
 
 MODEL_BUDGET_MARKER = "VOLUMETRIC BUDGET FOR ENTIRE MODEL"
-PIPE_BUDGET_MARKER = "BUDGET OF THE PIPE SYSTEM OF TIMESTEP"
 
 
 # =============================================================================
-# Shared model-run lock
+# 1. MODEL
 # =============================================================================
+# -----------------------------------------------------------------------------
+# 1.1 Runtime environment and model files
+# -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_model_run_lock() -> threading.Lock:
     """Return one process-wide lock shared by Streamlit sessions.
@@ -90,9 +134,6 @@ def get_model_run_lock() -> threading.Lock:
     return threading.Lock()
 
 
-# =============================================================================
-# General helpers
-# =============================================================================
 def _ensure_executable_permissions(path: Path) -> Path:
     """Ensure a bundled Linux solver can be executed on Streamlit Cloud.
 
@@ -179,11 +220,6 @@ def working_directory(path: Path):
         os.chdir(old_cwd)
 
 
-def _as_float(value: str) -> float:
-    """Convert ordinary or Fortran D-notation text to float."""
-    return float(value.replace("D", "E").replace("d", "e"))
-
-
 def find_output_file(workspace: Path, preferred_name: str, suffixes: tuple[str, ...]) -> Path:
     """Find a model output file robustly, including case variations."""
     preferred = workspace / preferred_name
@@ -201,15 +237,9 @@ def find_output_file(workspace: Path, preferred_name: str, suffixes: tuple[str, 
     )
 
 
-def format_elapsed_time(seconds: float) -> str:
-    """Compact time label for profile controls."""
-    if seconds < 60:
-        return f"{seconds:.0f} s"
-    if seconds < 3600:
-        return f"{seconds / 60.0:.1f} min"
-    return f"{seconds / 3600.0:.2f} h"
-
-
+# -----------------------------------------------------------------------------
+# 1.2 Time discretization helper
+# -----------------------------------------------------------------------------
 def build_time_vector(perlen: np.ndarray, n_stps: np.ndarray) -> np.ndarray:
     """Return cumulative simulation times at every saved time step."""
     intervals = np.concatenate(
@@ -221,9 +251,435 @@ def build_time_vector(perlen: np.ndarray, n_stps: np.ndarray) -> np.ndarray:
     return np.cumsum(intervals)
 
 
+# -----------------------------------------------------------------------------
+# 1.3 MODFLOW + CFP model design and execution
+# -----------------------------------------------------------------------------
+def cfpy_model(
+    dmt: float,
+    trtst: float,
+    rh: float,
+    lcrey: int,
+    hcrey: int,
+    kxch: float,
+    cfptemp: float,
+    hk: float,
+    sy: float,
+    CADS: float,
+    laminar_only: bool,
+) -> dict:
+    """Run the CFPy/MODFLOW model and return discharge plus head/flow diagnostics."""
+    executable = find_cfp_executable()
+
+    # This lock is necessary because parts of CFPy use the current working
+    # directory. It prevents simultaneous Streamlit sessions from changing cwd
+    # underneath one another.
+    with get_model_run_lock():
+        with tempfile.TemporaryDirectory(prefix="cfpy_streamlit_") as tmp:
+            workspace = Path(tmp)
+
+            with working_directory(workspace):
+                # -----------------------------------------------------------------
+                # 1.3.1 Initialize MODFLOW/CFP
+                # -----------------------------------------------------------------
+                mf = flopy.modflow.Modflow(
+                    MODEL_NAME,
+                    exe_name=str(executable),
+                    model_ws=str(workspace),
+                )
+
+                # -----------------------------------------------------------------
+                # 1.3.2 Continuum characteristics
+                # -----------------------------------------------------------------
+                delr = 50.0
+                finer_mesh = np.array([1.5, 2.5, 5.0, 10.0, 20.0, 35.0])
+                delc = np.hstack(
+                    [
+                        np.repeat(50.0, 6),
+                        np.flip(finer_mesh),
+                        np.array([1.0]),
+                        finer_mesh,
+                        np.repeat(50.0, 6),
+                    ]
+                )
+
+                n_rows = len(delc)
+                n_cols = 35
+                n_lays = 1
+                lay_elevs = [100.0, 0.0]
+
+                col_node_1 = int(np.floor(1225.0 / delr))
+                row_node_1 = int(np.floor(len(delc) / 2))
+
+                lay_elevs_array = [
+                    np.ones((n_rows, n_cols)) * lay_elevs[0],
+                    np.ones((n_rows, n_cols)) * lay_elevs[1],
+                ]
+
+                # -----------------------------------------------------------------
+                # 1.3.3 Time discretization
+                # -----------------------------------------------------------------
+                time_unit = 1  # seconds
+                n_pers = 3
+
+                LP1 = 2  # hours of injection
+                LP2 = 10  # hours after injection
+                TS1 = 60  # seconds
+                TS2 = 300  # seconds
+
+                perlen = np.array([1.0, LP1 * 3600.0, LP2 * 3600.0])
+                n_stps = np.array(
+                    [1, int(LP1 * 3600 / TS1), int(LP2 * 3600 / TS2)],
+                    dtype=int,
+                )
+                steady = np.array([True, False, False])
+                times = build_time_vector(perlen, n_stps)
+
+                # -----------------------------------------------------------------
+                # 1.3.4 Boundary and initial conditions
+                # -----------------------------------------------------------------
+                chb_left = 5.0
+                rch_background = (
+                    np.ones((n_rows, n_cols))
+                    * 316.0
+                    / (1000.0 * 365.25 * 86400.0)
+                )
+                rch_injection = rch_background.copy()
+                rch_injection[row_node_1, col_node_1] = 5.0 / 1000.0
+
+                h_init = 5.0
+
+                # -----------------------------------------------------------------
+                # 1.3.5 MODFLOW packages
+                # -----------------------------------------------------------------
+                flopy.modflow.ModflowDis(
+                    mf,
+                    n_lays,
+                    n_rows,
+                    n_cols,
+                    n_pers,
+                    delr,
+                    delc,
+                    top=lay_elevs[0],
+                    botm=lay_elevs[1],
+                    perlen=perlen,
+                    nstp=n_stps,
+                    steady=steady,
+                    itmuni=time_unit,
+                    lenuni=2,
+                )
+
+                ibound = np.ones((n_lays, n_rows, n_cols), dtype=np.int32)
+                ibound[:, :, 0] = -1
+                h_init_array = (
+                    np.ones((n_lays, n_rows, n_cols), dtype=np.float32) * h_init
+                )
+                h_init_array[:, :, 0] = chb_left
+                flopy.modflow.ModflowBas(mf, ibound=ibound, strt=h_init_array)
+
+                flopy.modflow.ModflowLpf(mf, laytyp=1, hk=hk, sy=sy)
+
+                # Save matrix heads at every model time. The original notebook
+                # used the default OC package, which saved the binary matrix
+                # head only at the initial steady-state step. Full head output
+                # is required for the selectable perpendicular transect.
+                oc_stress_period_data = {
+                    (per_idx, step_idx): ["save head"]
+                    for per_idx, nstep in enumerate(n_stps)
+                    for step_idx in range(int(nstep))
+                }
+                flopy.modflow.ModflowOc(
+                    mf,
+                    stress_period_data=oc_stress_period_data,
+                    compact=True,
+                )
+
+                flopy.modflow.ModflowPcg(
+                    mf,
+                    mxiter=2000,
+                    iter1=2000,
+                    npcond=1,
+                    hclose=1e-2,
+                    rclose=1e-2,
+                    relax=0.99,
+                    nbpol=2,
+                    iprpcg=5,
+                    mutpcg=0,
+                    damp=0.99,
+                    ihcofadd=9999,
+                )
+
+                rech = {
+                    0: rch_background,
+                    1: rch_injection,
+                    2: rch_background,
+                }
+                flopy.modflow.mfrch.ModflowRch(mf, nrchop=1, rech=rech)
+
+                # -----------------------------------------------------------------
+                # 1.3.6 CFP solver variables
+                # -----------------------------------------------------------------
+                cfptol = 1e-9
+                cfprelax = 0.99
+                chd_outlet = 5.0
+                elev_nodes = 1.0
+                cad = CADS
+
+                # -----------------------------------------------------------------
+                # 1.3.7 CFP conduit-network construction
+                # -----------------------------------------------------------------
+                network = np.zeros((n_rows, n_cols))
+                network[row_node_1, : (col_node_1 + 1)] = 1.0
+                elevations = np.ones((n_rows, n_cols)) * elev_nodes
+
+                validator = cfpy.preprocessing.GeneralValidator(
+                    network=network,
+                    elevations=elevations,
+                )
+                validator.validate_network()
+                validator.export_network()
+                validator.generate_nbr(
+                    path=str(workspace) + os.sep,
+                    nrows=n_rows,
+                    ncols=n_cols,
+                    nlays=n_lays,
+                    nplanes=1,
+                    layer_elevations=lay_elevs_array,
+                )
+
+                nbr = cfpy.nbr()
+                bot_elev, cond_elev = nbr.nbr_read()
+                nbr_data = nbr.nbr(bot_elev, cond_elev)
+
+                mf.write_input()
+
+                # -----------------------------------------------------------------
+                # 1.3.8 CFP pipe data
+                # -----------------------------------------------------------------
+                # ``Laminar only`` leaves the familiar user sliders unchanged but
+                # moves the CFP transition thresholds far above the simulated range.
+                # This is intentionally done only at model-write time so stored user
+                # settings remain transparent.
+                lcrey_model = int(lcrey * 10000) if laminar_only else int(lcrey)
+                hcrey_model = int(hcrey * 10000) if laminar_only else int(hcrey)
+
+                n_pipes = len(nbr_data[5])
+                pipe_data = [
+                    nbr_data[5],
+                    (np.ones(n_pipes) * dmt).tolist(),
+                    (np.ones(n_pipes) * trtst).tolist(),
+                    (np.ones(n_pipes) * rh).tolist(),
+                    (np.ones(n_pipes) * lcrey_model).tolist(),
+                    (np.ones(n_pipes) * hcrey_model).tolist(),
+                ]
+
+                # -----------------------------------------------------------------
+                # 1.3.9 CFP node and exchange data
+                # -----------------------------------------------------------------
+                n_head = (np.ones(len(nbr_data[0])) * -1).tolist()
+                outlet_pos = nbr_data[2].index([1, row_node_1 + 1, 1])
+                n_head[outlet_pos] = chd_outlet
+                node_data = [nbr_data[0], n_head]
+
+                kex_data = [
+                    nbr_data[0],
+                    np.ones(len(nbr_data[0])) * kxch,
+                ]
+                cads_data = (np.ones(len(nbr_data[0])) * cad).tolist()
+
+                # -----------------------------------------------------------------
+                # 1.3.10 CFP package and input files
+                # -----------------------------------------------------------------
+                cfp_data = cfpy.cfp(
+                    mode=1,
+                    nnodes=len(nbr_data[0]),
+                    npipes=len(nbr_data[5]),
+                    nlay=n_lays,
+                    nbr_data=nbr_data,
+                    geoheight=cond_elev,
+                    sa_exchange=1,
+                    epsilon=cfptol,
+                    niter=2000,
+                    relax=cfprelax,
+                    p_nr=0,
+                    cond_data=pipe_data,
+                    n_head=node_data,
+                    k_exchange=kex_data,
+                    ncl=0,
+                    cl=0,
+                    ltemp=cfptemp,
+                    condl_data=0,
+                    cads=cads_data,
+                ).cfp()
+
+                coc_data = cfpy.coc(
+                    nnodes=len(nbr_data[0]),
+                    node_numbers=nbr_data[0],
+                    n_nts=1,
+                    npipes=len(nbr_data[5]),
+                    pipe_numbers=nbr_data[5],
+                    t_nts=1,
+                ).coc()
+
+                p_crch = np.zeros(len(nbr_data[0])).tolist()
+                injection_pos = nbr_data[2].index(
+                    [col_node_1 + 1, row_node_1 + 1, 1]
+                )
+                p_crch[injection_pos] = 1.0
+                crch_data = cfpy.crch(
+                    iflag_crch=1,
+                    nper=n_pers,
+                    node_numbers=nbr_data[0],
+                    p_crch=p_crch,
+                ).crch()
+
+                cfpy.write_input(
+                    modelname=MODEL_NAME,
+                    data_strings=[coc_data, crch_data, cfp_data],
+                    file_extensions=["coc", "crch", "cfp"],
+                ).write_input()
+
+                cfpy.update_nam(
+                    modelname=MODEL_NAME,
+                    mode=1,
+                    cfp_unit_num=52,
+                    crch_unit_num=53,
+                    coc_unit_num=54,
+                ).update_nam()
+
+                # -----------------------------------------------------------------
+                # 1.3.11 Execute CFP/MODFLOW
+                # -----------------------------------------------------------------
+                success, model_buffer = mf.run_model(silent=True, report=True)
+                if not success:
+                    tail = "\n".join(model_buffer[-20:]) if model_buffer else ""
+                    raise RuntimeError(
+                        "The CFP/MODFLOW model did not converge."
+                        + (f"\n\nLast model messages:\n{tail}" if tail else "")
+                    )
+
+                # -----------------------------------------------------------------
+                # 1.3.12 External conduit boundary fluxes from the CFP node table
+                # -----------------------------------------------------------------
+                # DIRECT RECHARGE is the imposed sinkhole/direct-conduit inflow.
+                # QFIX is the fixed-head-node flux; negative QFIX is outflow to the
+                # spring. These are external boundary fluxes and can differ from the
+                # adjacent tube Q because water may exchange with the matrix at the
+                # boundary node itself.
+                listing_file = find_output_file(
+                    workspace,
+                    f"{MODEL_NAME}.list",
+                    (".list", ".lst"),
+                )
+                listing_results = parse_cfp_listing(listing_file, times)
+
+                spring_flow = np.asarray(
+                    listing_results["spring_outflow"], dtype=float
+                )
+                inlet_flow = np.asarray(
+                    listing_results["direct_recharge_total"], dtype=float
+                )
+
+                if len(spring_flow) != len(times) or len(inlet_flow) != len(times):
+                    raise ValueError(
+                        "Unexpected number of CFP boundary-flow outputs in the "
+                        "listing-file node table."
+                    )
+
+                qfix_nodes = np.asarray(
+                    listing_results.get("qfix_nodes", []), dtype=int
+                )
+                direct_nodes = np.asarray(
+                    listing_results.get("direct_recharge_nodes", []), dtype=int
+                )
+                spring_node_number = int(qfix_nodes[0]) if qfix_nodes.size else None
+                inlet_node_number = int(direct_nodes[0]) if direct_nodes.size else None
+
+                def _connected_tube_for_node(node_number: int | None) -> int | None:
+                    if node_number is None:
+                        return None
+                    begin = np.asarray(
+                        listing_results["tube_begin_nodes"], dtype=int
+                    )
+                    end = np.asarray(
+                        listing_results["tube_end_nodes"], dtype=int
+                    )
+                    connected = np.where(
+                        (begin == int(node_number)) | (end == int(node_number))
+                    )[0]
+                    if connected.size == 0:
+                        return None
+                    return int(
+                        np.asarray(listing_results["tube_numbers"], dtype=int)[
+                            connected[0]
+                        ]
+                    )
+
+                # Kept as metadata for orientation only. Current-result boundary
+                # discharge is no longer taken from these tube flows.
+                spring_tube_number = _connected_tube_for_node(spring_node_number)
+                inlet_tube_number = _connected_tube_for_node(inlet_node_number)
+
+                # -----------------------------------------------------------------
+                # 1.3.13 Cumulative whole-run water budget
+                # -----------------------------------------------------------------
+                budget: dict | None = None
+                budget_error: str | None = None
+                try:
+                    budget = parse_cumulative_water_budget(
+                        listing_file,
+                        expected_times=times,
+                        listing_data=listing_results,
+                    )
+                except Exception as exc:
+                    budget_error = str(exc)
+
+                # -----------------------------------------------------------------
+                # 1.3.14 Head and flow diagnostics
+                # -----------------------------------------------------------------
+                diagnostics: dict | None = None
+                diagnostics_error: str | None = None
+
+                try:
+                    diagnostics = build_head_diagnostics(
+                        workspace=workspace,
+                        expected_times=times,
+                        delr=delr,
+                        delc=delc,
+                        n_rows=n_rows,
+                        n_cols=n_cols,
+                        listing_data=listing_results,
+                    )
+                except Exception as exc:
+                    # Do not discard a successful boundary-flow simulation just
+                    # because the binary head file could not be post-processed.
+                    diagnostics_error = str(exc)
+
+    return {
+        "times": np.asarray(times, dtype=float),
+        # ``flow`` remains the stored-run comparison alias for spring discharge.
+        "flow": np.asarray(spring_flow, dtype=float),
+        "spring_flow": np.asarray(spring_flow, dtype=float),
+        # Backward-compatible alias: this is now the external DIRECT RECHARGE
+        # boundary flux, not the adjacent inlet-tube discharge.
+        "inlet_flow": np.asarray(inlet_flow, dtype=float),
+        "direct_recharge_flow": np.asarray(inlet_flow, dtype=float),
+        "spring_node_number": spring_node_number,
+        "inlet_node_number": inlet_node_number,
+        "spring_tube_number": spring_tube_number,
+        "inlet_tube_number": inlet_tube_number,
+        "budget": budget,
+        "budget_error": budget_error,
+        "diagnostics": diagnostics,
+        "diagnostics_error": diagnostics_error,
+    }
+
+
 # =============================================================================
-# CFP listing-file post-processing
+# 2. MODEL OUTPUT AND POST-PROCESSING
 # =============================================================================
+# -----------------------------------------------------------------------------
+# 2.1 Cumulative water-budget parsing
+# -----------------------------------------------------------------------------
 def _parse_last_cumulative_budget_block(
     lines: list[str],
     marker: str,
@@ -263,7 +719,6 @@ def _parse_last_cumulative_budget_block(
             values[direction][match.group(1).upper()] = _as_float(match.group(2))
 
     return values
-
 
 
 def _integrate_step_rates(times: np.ndarray, rates: np.ndarray) -> float:
@@ -350,6 +805,13 @@ def parse_cumulative_water_budget(
     }
 
 
+# -----------------------------------------------------------------------------
+# 2.2 CFP listing-file parsing
+# -----------------------------------------------------------------------------
+def _as_float(value: str) -> float:
+    """Convert ordinary or Fortran D-notation text to float."""
+    return float(value.replace("D", "E").replace("d", "e"))
+
 
 def _parse_cfp_node_result_line(
     line: str,
@@ -416,7 +878,7 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
     lines = text_listing.splitlines()
 
     # -------------------------------------------------------------------------
-    # Node coordinates
+    # 2.2.1 CFP node coordinates
     # -------------------------------------------------------------------------
     coordinates: list[tuple[int, int, int, int, float, float, float]] = []
     reading_coordinates = False
@@ -460,7 +922,7 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
         raise ValueError("Duplicate CFP node numbers were found in the coordinate table.")
 
     # -------------------------------------------------------------------------
-    # Flow-calculation result blocks
+    # 2.2.2 CFP flow-calculation result blocks
     # -------------------------------------------------------------------------
     result_blocks: list[dict] = []
     current_stress_period: int | None = None
@@ -691,6 +1153,9 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
     }
 
 
+# -----------------------------------------------------------------------------
+# 2.3 MODFLOW matrix-head output and diagnostic assembly
+# -----------------------------------------------------------------------------
 def read_matrix_head_snapshots(
     head_file: Path,
     expected_times: np.ndarray,
@@ -816,431 +1281,298 @@ def build_head_diagnostics(
 
 
 # =============================================================================
-# Numerical model
+# 3. USER INPUT, RUN STATE, AND DIAGNOSTIC SELECTION
 # =============================================================================
-def cfpy_model(
-    dmt: float,
-    trtst: float,
-    rh: float,
-    lcrey: int,
-    hcrey: int,
-    kxch: float,
-    cfptemp: float,
-    hk: float,
-    sy: float,
-    CADS: float,
-    laminar_only: bool,
-) -> dict:
-    """Run the CFPy/MODFLOW model and return discharge plus head/flow diagnostics."""
-    executable = find_cfp_executable()
-
-    # This lock is necessary because parts of CFPy use the current working
-    # directory. It prevents simultaneous Streamlit sessions from changing cwd
-    # underneath one another.
-    with get_model_run_lock():
-        with tempfile.TemporaryDirectory(prefix="cfpy_streamlit_") as tmp:
-            workspace = Path(tmp)
-
-            with working_directory(workspace):
-                # -----------------------------------------------------------------
-                # Initialize MODFLOW/CFP
-                # -----------------------------------------------------------------
-                mf = flopy.modflow.Modflow(
-                    MODEL_NAME,
-                    exe_name=str(executable),
-                    model_ws=str(workspace),
-                )
-
-                # -----------------------------------------------------------------
-                # Continuum characteristics
-                # -----------------------------------------------------------------
-                delr = 50.0
-                finer_mesh = np.array([1.5, 2.5, 5.0, 10.0, 20.0, 35.0])
-                delc = np.hstack(
-                    [
-                        np.repeat(50.0, 6),
-                        np.flip(finer_mesh),
-                        np.array([1.0]),
-                        finer_mesh,
-                        np.repeat(50.0, 6),
-                    ]
-                )
-
-                n_rows = len(delc)
-                n_cols = 35
-                n_lays = 1
-                lay_elevs = [100.0, 0.0]
-
-                col_node_1 = int(np.floor(1225.0 / delr))
-                row_node_1 = int(np.floor(len(delc) / 2))
-
-                lay_elevs_array = [
-                    np.ones((n_rows, n_cols)) * lay_elevs[0],
-                    np.ones((n_rows, n_cols)) * lay_elevs[1],
-                ]
-
-                # -----------------------------------------------------------------
-                # Time discretization
-                # -----------------------------------------------------------------
-                time_unit = 1  # seconds
-                n_pers = 3
-
-                LP1 = 2  # hours of injection
-                LP2 = 10  # hours after injection
-                TS1 = 60  # seconds
-                TS2 = 300  # seconds
-
-                perlen = np.array([1.0, LP1 * 3600.0, LP2 * 3600.0])
-                n_stps = np.array(
-                    [1, int(LP1 * 3600 / TS1), int(LP2 * 3600 / TS2)],
-                    dtype=int,
-                )
-                steady = np.array([True, False, False])
-                times = build_time_vector(perlen, n_stps)
-
-                # -----------------------------------------------------------------
-                # Boundary and initial conditions
-                # -----------------------------------------------------------------
-                chb_left = 5.0
-                rch_background = (
-                    np.ones((n_rows, n_cols))
-                    * 316.0
-                    / (1000.0 * 365.25 * 86400.0)
-                )
-                rch_injection = rch_background.copy()
-                rch_injection[row_node_1, col_node_1] = 5.0 / 1000.0
-
-                h_init = 5.0
-
-                # -----------------------------------------------------------------
-                # MODFLOW packages
-                # -----------------------------------------------------------------
-                flopy.modflow.ModflowDis(
-                    mf,
-                    n_lays,
-                    n_rows,
-                    n_cols,
-                    n_pers,
-                    delr,
-                    delc,
-                    top=lay_elevs[0],
-                    botm=lay_elevs[1],
-                    perlen=perlen,
-                    nstp=n_stps,
-                    steady=steady,
-                    itmuni=time_unit,
-                    lenuni=2,
-                )
-
-                ibound = np.ones((n_lays, n_rows, n_cols), dtype=np.int32)
-                ibound[:, :, 0] = -1
-                h_init_array = (
-                    np.ones((n_lays, n_rows, n_cols), dtype=np.float32) * h_init
-                )
-                h_init_array[:, :, 0] = chb_left
-                flopy.modflow.ModflowBas(mf, ibound=ibound, strt=h_init_array)
-
-                flopy.modflow.ModflowLpf(mf, laytyp=1, hk=hk, sy=sy)
-
-                # Save matrix heads at every model time. The original notebook
-                # used the default OC package, which saved the binary matrix
-                # head only at the initial steady-state step. Full head output
-                # is required for the selectable perpendicular transect.
-                oc_stress_period_data = {
-                    (per_idx, step_idx): ["save head"]
-                    for per_idx, nstep in enumerate(n_stps)
-                    for step_idx in range(int(nstep))
-                }
-                flopy.modflow.ModflowOc(
-                    mf,
-                    stress_period_data=oc_stress_period_data,
-                    compact=True,
-                )
-
-                flopy.modflow.ModflowPcg(
-                    mf,
-                    mxiter=2000,
-                    iter1=2000,
-                    npcond=1,
-                    hclose=1e-2,
-                    rclose=1e-2,
-                    relax=0.99,
-                    nbpol=2,
-                    iprpcg=5,
-                    mutpcg=0,
-                    damp=0.99,
-                    ihcofadd=9999,
-                )
-
-                rech = {
-                    0: rch_background,
-                    1: rch_injection,
-                    2: rch_background,
-                }
-                flopy.modflow.mfrch.ModflowRch(mf, nrchop=1, rech=rech)
-
-                # -----------------------------------------------------------------
-                # CFP variables
-                # -----------------------------------------------------------------
-                cfptol = 1e-9
-                cfprelax = 0.99
-                chd_outlet = 5.0
-                elev_nodes = 1.0
-                cad = CADS
-
-                # -----------------------------------------------------------------
-                # Create conduit network
-                # -----------------------------------------------------------------
-                network = np.zeros((n_rows, n_cols))
-                network[row_node_1, : (col_node_1 + 1)] = 1.0
-                elevations = np.ones((n_rows, n_cols)) * elev_nodes
-
-                validator = cfpy.preprocessing.GeneralValidator(
-                    network=network,
-                    elevations=elevations,
-                )
-                validator.validate_network()
-                validator.export_network()
-                validator.generate_nbr(
-                    path=str(workspace) + os.sep,
-                    nrows=n_rows,
-                    ncols=n_cols,
-                    nlays=n_lays,
-                    nplanes=1,
-                    layer_elevations=lay_elevs_array,
-                )
-
-                nbr = cfpy.nbr()
-                bot_elev, cond_elev = nbr.nbr_read()
-                nbr_data = nbr.nbr(bot_elev, cond_elev)
-
-                mf.write_input()
-
-                # -----------------------------------------------------------------
-                # Pipe data
-                # -----------------------------------------------------------------
-                # ``Laminar only`` leaves the familiar user sliders unchanged but
-                # moves the CFP transition thresholds far above the simulated range.
-                # This is intentionally done only at model-write time so stored user
-                # settings remain transparent.
-                lcrey_model = int(lcrey * 10000) if laminar_only else int(lcrey)
-                hcrey_model = int(hcrey * 10000) if laminar_only else int(hcrey)
-
-                n_pipes = len(nbr_data[5])
-                pipe_data = [
-                    nbr_data[5],
-                    (np.ones(n_pipes) * dmt).tolist(),
-                    (np.ones(n_pipes) * trtst).tolist(),
-                    (np.ones(n_pipes) * rh).tolist(),
-                    (np.ones(n_pipes) * lcrey_model).tolist(),
-                    (np.ones(n_pipes) * hcrey_model).tolist(),
-                ]
-
-                # -----------------------------------------------------------------
-                # Node data
-                # -----------------------------------------------------------------
-                n_head = (np.ones(len(nbr_data[0])) * -1).tolist()
-                outlet_pos = nbr_data[2].index([1, row_node_1 + 1, 1])
-                n_head[outlet_pos] = chd_outlet
-                node_data = [nbr_data[0], n_head]
-
-                kex_data = [
-                    nbr_data[0],
-                    np.ones(len(nbr_data[0])) * kxch,
-                ]
-                cads_data = (np.ones(len(nbr_data[0])) * cad).tolist()
-
-                # -----------------------------------------------------------------
-                # CFP package
-                # -----------------------------------------------------------------
-                cfp_data = cfpy.cfp(
-                    mode=1,
-                    nnodes=len(nbr_data[0]),
-                    npipes=len(nbr_data[5]),
-                    nlay=n_lays,
-                    nbr_data=nbr_data,
-                    geoheight=cond_elev,
-                    sa_exchange=1,
-                    epsilon=cfptol,
-                    niter=2000,
-                    relax=cfprelax,
-                    p_nr=0,
-                    cond_data=pipe_data,
-                    n_head=node_data,
-                    k_exchange=kex_data,
-                    ncl=0,
-                    cl=0,
-                    ltemp=cfptemp,
-                    condl_data=0,
-                    cads=cads_data,
-                ).cfp()
-
-                coc_data = cfpy.coc(
-                    nnodes=len(nbr_data[0]),
-                    node_numbers=nbr_data[0],
-                    n_nts=1,
-                    npipes=len(nbr_data[5]),
-                    pipe_numbers=nbr_data[5],
-                    t_nts=1,
-                ).coc()
-
-                p_crch = np.zeros(len(nbr_data[0])).tolist()
-                injection_pos = nbr_data[2].index(
-                    [col_node_1 + 1, row_node_1 + 1, 1]
-                )
-                p_crch[injection_pos] = 1.0
-                crch_data = cfpy.crch(
-                    iflag_crch=1,
-                    nper=n_pers,
-                    node_numbers=nbr_data[0],
-                    p_crch=p_crch,
-                ).crch()
-
-                cfpy.write_input(
-                    modelname=MODEL_NAME,
-                    data_strings=[coc_data, crch_data, cfp_data],
-                    file_extensions=["coc", "crch", "cfp"],
-                ).write_input()
-
-                cfpy.update_nam(
-                    modelname=MODEL_NAME,
-                    mode=1,
-                    cfp_unit_num=52,
-                    crch_unit_num=53,
-                    coc_unit_num=54,
-                ).update_nam()
-
-                # -----------------------------------------------------------------
-                # Run model
-                # -----------------------------------------------------------------
-                success, model_buffer = mf.run_model(silent=True, report=True)
-                if not success:
-                    tail = "\n".join(model_buffer[-20:]) if model_buffer else ""
-                    raise RuntimeError(
-                        "The CFP/MODFLOW model did not converge."
-                        + (f"\n\nLast model messages:\n{tail}" if tail else "")
-                    )
-
-                # -----------------------------------------------------------------
-                # External conduit boundary fluxes from the CFP node table
-                # -----------------------------------------------------------------
-                # DIRECT RECHARGE is the imposed sinkhole/direct-conduit inflow.
-                # QFIX is the fixed-head-node flux; negative QFIX is outflow to the
-                # spring. These are external boundary fluxes and can differ from the
-                # adjacent tube Q because water may exchange with the matrix at the
-                # boundary node itself.
-                listing_file = find_output_file(
-                    workspace,
-                    f"{MODEL_NAME}.list",
-                    (".list", ".lst"),
-                )
-                listing_results = parse_cfp_listing(listing_file, times)
-
-                spring_flow = np.asarray(
-                    listing_results["spring_outflow"], dtype=float
-                )
-                inlet_flow = np.asarray(
-                    listing_results["direct_recharge_total"], dtype=float
-                )
-
-                if len(spring_flow) != len(times) or len(inlet_flow) != len(times):
-                    raise ValueError(
-                        "Unexpected number of CFP boundary-flow outputs in the "
-                        "listing-file node table."
-                    )
-
-                qfix_nodes = np.asarray(
-                    listing_results.get("qfix_nodes", []), dtype=int
-                )
-                direct_nodes = np.asarray(
-                    listing_results.get("direct_recharge_nodes", []), dtype=int
-                )
-                spring_node_number = int(qfix_nodes[0]) if qfix_nodes.size else None
-                inlet_node_number = int(direct_nodes[0]) if direct_nodes.size else None
-
-                def _connected_tube_for_node(node_number: int | None) -> int | None:
-                    if node_number is None:
-                        return None
-                    begin = np.asarray(
-                        listing_results["tube_begin_nodes"], dtype=int
-                    )
-                    end = np.asarray(
-                        listing_results["tube_end_nodes"], dtype=int
-                    )
-                    connected = np.where(
-                        (begin == int(node_number)) | (end == int(node_number))
-                    )[0]
-                    if connected.size == 0:
-                        return None
-                    return int(
-                        np.asarray(listing_results["tube_numbers"], dtype=int)[
-                            connected[0]
-                        ]
-                    )
-
-                # Kept as metadata for orientation only. Current-result boundary
-                # discharge is no longer taken from these tube flows.
-                spring_tube_number = _connected_tube_for_node(spring_node_number)
-                inlet_tube_number = _connected_tube_for_node(inlet_node_number)
-
-                # -----------------------------------------------------------------
-                # Cumulative whole-run water budget
-                # -----------------------------------------------------------------
-                budget: dict | None = None
-                budget_error: str | None = None
-                try:
-                    budget = parse_cumulative_water_budget(
-                        listing_file,
-                        expected_times=times,
-                        listing_data=listing_results,
-                    )
-                except Exception as exc:
-                    budget_error = str(exc)
-
-                # -----------------------------------------------------------------
-                # Optional head and flow diagnostics
-                # -----------------------------------------------------------------
-                diagnostics: dict | None = None
-                diagnostics_error: str | None = None
-
-                try:
-                    diagnostics = build_head_diagnostics(
-                        workspace=workspace,
-                        expected_times=times,
-                        delr=delr,
-                        delc=delc,
-                        n_rows=n_rows,
-                        n_cols=n_cols,
-                        listing_data=listing_results,
-                    )
-                except Exception as exc:
-                    # Do not discard a successful boundary-flow simulation just
-                    # because the binary head file could not be post-processed.
-                    diagnostics_error = str(exc)
-
-    return {
-        "times": np.asarray(times, dtype=float),
-        # ``flow`` remains the stored-run comparison alias for spring discharge.
-        "flow": np.asarray(spring_flow, dtype=float),
-        "spring_flow": np.asarray(spring_flow, dtype=float),
-        # Backward-compatible alias: this is now the external DIRECT RECHARGE
-        # boundary flux, not the adjacent inlet-tube discharge.
-        "inlet_flow": np.asarray(inlet_flow, dtype=float),
-        "direct_recharge_flow": np.asarray(inlet_flow, dtype=float),
-        "spring_node_number": spring_node_number,
-        "inlet_node_number": inlet_node_number,
-        "spring_tube_number": spring_tube_number,
-        "inlet_tube_number": inlet_tube_number,
-        "budget": budget,
-        "budget_error": budget_error,
-        "diagnostics": diagnostics,
-        "diagnostics_error": diagnostics_error,
-    }
+# -----------------------------------------------------------------------------
+# 3.1 Synchronized numerical-input helpers
+# -----------------------------------------------------------------------------
+def _clip_numeric(value: float, minimum: float, maximum: float) -> float:
+    """Clip a numerical UI value to the widget range."""
+    return min(max(float(value), float(minimum)), float(maximum))
 
 
-# =============================================================================
-# Presentation helpers
-# =============================================================================
+def _sync_linear_widget_to_value(
+    widget_key: str, value_key: str, integer: bool = False
+) -> None:
+    """Copy a linear slider/number widget value into canonical session state."""
+    value = st.session_state[widget_key]
+    st.session_state[value_key] = int(value) if integer else float(value)
+
+
+def synced_numeric_input(
+    label: str,
+    *,
+    base_key: str,
+    minimum: float,
+    maximum: float,
+    default: float,
+    step: float,
+    number_mode: bool,
+    format_string: str | None = None,
+    help_text: str | None = None,
+    disabled: bool = False,
+    integer: bool = False,
+    force_sync: bool = False,
+) -> float | int:
+    """Render slider or number_input while preserving one canonical value.
+
+    The widget type can be changed globally without changing the represented
+    model parameter. A small per-control mode flag prevents stale inactive
+    widget state from being restored when the user switches input mode.
+    """
+    value_key = f"{base_key}__value"
+    slider_key = f"{base_key}__slider"
+    number_key = f"{base_key}__number"
+    mode_key = f"{base_key}__last_number_mode"
+
+    if value_key not in st.session_state:
+        initial = _clip_numeric(default, minimum, maximum)
+        st.session_state[value_key] = int(round(initial)) if integer else float(initial)
+
+    canonical = _clip_numeric(st.session_state[value_key], minimum, maximum)
+    canonical = int(round(canonical)) if integer else float(canonical)
+    st.session_state[value_key] = canonical
+
+    previous_mode = st.session_state.get(mode_key)
+    mode_changed = previous_mode is None or bool(previous_mode) != bool(number_mode)
+
+    if number_mode:
+        if force_sync or mode_changed or number_key not in st.session_state:
+            st.session_state[number_key] = canonical
+        number_kwargs = {
+            "min_value": int(minimum) if integer else float(minimum),
+            "max_value": int(maximum) if integer else float(maximum),
+            "step": int(step) if integer else float(step),
+            "key": number_key,
+            "help": help_text,
+            "disabled": disabled,
+            "on_change": _sync_linear_widget_to_value,
+            "args": (number_key, value_key, integer),
+        }
+        if format_string is not None:
+            number_kwargs["format"] = format_string
+        widget_value = st.number_input(label, **number_kwargs)
+    else:
+        if force_sync or mode_changed or slider_key not in st.session_state:
+            st.session_state[slider_key] = canonical
+        slider_kwargs = {
+            "min_value": int(minimum) if integer else float(minimum),
+            "max_value": int(maximum) if integer else float(maximum),
+            "step": int(step) if integer else float(step),
+            "key": slider_key,
+            "help": help_text,
+            "disabled": disabled,
+            "on_change": _sync_linear_widget_to_value,
+            "args": (slider_key, value_key, integer),
+        }
+        if format_string is not None:
+            slider_kwargs["format"] = format_string
+        widget_value = st.slider(label, **slider_kwargs)
+
+    canonical = int(widget_value) if integer else float(widget_value)
+    st.session_state[value_key] = canonical
+    st.session_state[mode_key] = bool(number_mode)
+    return canonical
+
+
+def parameter_input(
+    label,
+    key,
+    default,
+    min_value,
+    max_value,
+    *,
+    step=None,
+    scale="linear",
+    use_number_input=False,
+    number_format=None,
+    log_steps_per_decade=20,
+):
+    """
+    Parameter input that can switch between slider and number input
+    while preserving the current value.
+
+    scale="linear":
+        Standard linear slider.
+
+    scale="log":
+        Logarithmically spaced slider using physical parameter values.
+        The corresponding number input uses an automatically scaled
+        additive step.
+    """
+
+    import numpy as np
+    import streamlit as st
+
+    # -------------------------------------------------------------------------
+    # Basic checks
+    # -------------------------------------------------------------------------
+
+    if scale not in ("linear", "log"):
+        raise ValueError("scale must be 'linear' or 'log'.")
+
+    if min_value >= max_value:
+        raise ValueError("min_value must be smaller than max_value.")
+
+    if not min_value <= default <= max_value:
+        raise ValueError("default must be between min_value and max_value.")
+
+    if scale == "log" and min_value <= 0:
+        raise ValueError("Logarithmic parameters must be positive.")
+
+    # -------------------------------------------------------------------------
+    # Keys
+    # -------------------------------------------------------------------------
+
+    value_key = f"{key}__value"
+
+    # -------------------------------------------------------------------------
+    # Internal callback
+    # -------------------------------------------------------------------------
+
+    def update_value(widget_key):
+        st.session_state[value_key] = float(
+            st.session_state[widget_key]
+        )
+
+    # -------------------------------------------------------------------------
+    # Permanent parameter state
+    # -------------------------------------------------------------------------
+
+    if value_key not in st.session_state:
+        st.session_state[value_key] = float(default)
+
+    current_value = float(st.session_state[value_key])
+
+    current_value = min(
+        max(current_value, float(min_value)),
+        float(max_value),
+    )
+
+    st.session_state[value_key] = current_value
+
+    # =========================================================================
+    # NUMBER INPUT
+    # =========================================================================
+
+    if use_number_input:
+
+        widget_key = f"_{key}__number"
+
+        st.session_state[widget_key] = current_value
+
+        # Determine suitable step
+        if step is not None:
+
+            number_step = float(step)
+
+        elif scale == "log":
+
+            exponent = np.floor(np.log10(current_value))
+            number_step = 10.0 ** (exponent - 1)
+
+        else:
+
+            number_step = 0.01
+
+        kwargs = {
+            "label": label,
+            "min_value": float(min_value),
+            "max_value": float(max_value),
+            "step": float(number_step),
+            "key": widget_key,
+            "on_change": update_value,
+            "args": (widget_key,),
+        }
+
+        if number_format is not None:
+            kwargs["format"] = number_format
+
+        elif scale == "log":
+            kwargs["format"] = "%.2e"
+
+        st.number_input(**kwargs)
+
+    # =========================================================================
+    # LINEAR SLIDER
+    # =========================================================================
+
+    elif scale == "linear":
+
+        widget_key = f"_{key}__slider"
+
+        st.session_state[widget_key] = current_value
+
+        kwargs = {
+            "label": label,
+            "min_value": float(min_value),
+            "max_value": float(max_value),
+            "key": widget_key,
+            "on_change": update_value,
+            "args": (widget_key,),
+        }
+
+        if step is not None:
+            kwargs["step"] = float(step)
+
+        if number_format is not None:
+            kwargs["format"] = number_format
+
+        st.slider(**kwargs)
+
+    # =========================================================================
+    # LOGARITHMIC SLIDER
+    # =========================================================================
+
+    else:
+
+        widget_key = f"_{key}__slider"
+
+        decades = np.log10(max_value) - np.log10(min_value)
+
+        n_intervals = max(
+            1,
+            int(round(decades * log_steps_per_decade)),
+        )
+
+        options = np.logspace(
+            np.log10(min_value),
+            np.log10(max_value),
+            n_intervals + 1,
+        )
+
+        # Preserve arbitrary values entered with number_input
+        if not np.any(
+            np.isclose(
+                options,
+                current_value,
+                rtol=1e-12,
+                atol=0.0,
+            )
+        ):
+            options = np.append(options, current_value)
+
+        options = np.unique(
+            np.sort(options)
+        ).tolist()
+
+        st.session_state[widget_key] = current_value
+
+        st.select_slider(
+            label,
+            options=options,
+            key=widget_key,
+            format_func=lambda x: f"{x:.2e}",
+            on_change=update_value,
+            args=(widget_key,),
+        )
+
+    return float(st.session_state[value_key])
+
+
+# -----------------------------------------------------------------------------
+# 3.2 Stored-run data and rolling history
+# -----------------------------------------------------------------------------
 def parameter_table(params: dict) -> pd.DataFrame:
     labels = {
         "dmt": "Conduit diameter d [m]",
@@ -1263,40 +1595,202 @@ def parameter_table(params: dict) -> pd.DataFrame:
     )
 
 
-def copy_diagnostics(diagnostics: dict | None) -> dict | None:
-    """Copy diagnostics when a run is remembered in session state."""
-    if diagnostics is None:
-        return None
+def parameter_sets_equal(first: dict, second: dict) -> bool:
+    """Return True when two model-control dictionaries represent the same setup."""
+    if first.keys() != second.keys():
+        return False
 
-    copied: dict = {}
-    for key, value in diagnostics.items():
-        if isinstance(value, np.ndarray):
-            copied[key] = value.copy()
-        else:
-            copied[key] = value
-    return copied
+    for key in first:
+        a = first[key]
+        b = second[key]
+        if isinstance(a, (float, np.floating)) or isinstance(b, (float, np.floating)):
+            if not np.isclose(float(a), float(b), rtol=1.0e-12, atol=0.0):
+                return False
+        elif a != b:
+            return False
+    return True
 
 
-def copy_run_for_storage(run: dict) -> dict:
-    """Return an explicit detached copy of all compact run-level result fields."""
-    return {
-        "params": run["params"].copy(),
-        "times": run["times"].copy(),
-        "flow": run["flow"].copy(),
-        "spring_flow": run["spring_flow"].copy(),
-        "inlet_flow": run["inlet_flow"].copy(),
-        "direct_recharge_flow": run.get(
-            "direct_recharge_flow", run["inlet_flow"]
-        ).copy(),
-        "spring_node_number": run.get("spring_node_number"),
-        "inlet_node_number": run.get("inlet_node_number"),
-        "spring_tube_number": run.get("spring_tube_number"),
-        "inlet_tube_number": run.get("inlet_tube_number"),
-        "budget": dict(run["budget"]) if run.get("budget") is not None else None,
-        "budget_error": run.get("budget_error"),
-        "diagnostics": copy_diagnostics(run.get("diagnostics")),
-        "diagnostics_error": run.get("diagnostics_error"),
+def store_run_in_rolling_history(run: dict) -> dict:
+    """Store a successful run in five cyclic, stable storage slots.
+
+    Visible names are user-editable. Slot identity is therefore kept separately
+    from the name so renaming a run can never break the rolling-history logic.
+    """
+    st.session_state.total_run_count += 1
+    execution_number = int(st.session_state.total_run_count)
+    slot_number = ((execution_number - 1) % MAX_STORED_RUNS) + 1
+    default_name = f"run{slot_number}"
+
+    stored_run = {
+        "name": default_name,
+        "slot_number": slot_number,
+        "color": RUN_COLORS[slot_number - 1],
+        "execution_number": execution_number,
+        **run,
     }
+
+    # Remove the previous content of this storage slot, independent of any
+    # user-assigned display name, and append the new result as the newest run.
+    history = [
+        item
+        for item in st.session_state.saved_scenarios
+        if int(item["slot_number"]) != slot_number
+    ]
+    history.append(stored_run)
+    st.session_state.saved_scenarios = history[-MAX_STORED_RUNS:]
+
+    # Comparison selection uses stable execution numbers, not editable names.
+    if "comparison_run_selection" in st.session_state:
+        valid_ids = {
+            int(item["execution_number"])
+            for item in st.session_state.saved_scenarios
+        }
+        selected = [
+            int(run_id)
+            for run_id in st.session_state.comparison_run_selection
+            if int(run_id) in valid_ids and int(run_id) != execution_number
+        ]
+        selected.append(execution_number)
+        st.session_state.comparison_run_selection = selected
+
+    return stored_run
+
+
+def sync_current_run_name_from_widget() -> None:
+    """Persist an edited current-run name before another model run starts.
+
+    This helper is intentionally called before the Run button is processed. It
+    therefore also catches a text edit when the user immediately clicks Run.
+    """
+    current = st.session_state.current_run
+    if current is None:
+        return
+
+    key = f"run_name_input_{int(current['execution_number'])}"
+    if key not in st.session_state:
+        return
+
+    proposed = str(st.session_state[key]).strip()
+    if not proposed:
+        proposed = f"run{int(current['slot_number'])}"
+
+    current["name"] = proposed
+    for item in st.session_state.saved_scenarios:
+        if int(item["execution_number"]) == int(current["execution_number"]):
+            item["name"] = proposed
+            break
+
+
+# -----------------------------------------------------------------------------
+# 3.3 Diagnostic node/tube selection and geometry
+# -----------------------------------------------------------------------------
+def selected_node_metadata(diagnostics: dict, node_number: int) -> tuple[int, int]:
+    """Return zero-based node index and one-based MODFLOW column for a CFP node."""
+    node_numbers = np.asarray(diagnostics["node_numbers"], dtype=int)
+    matches = np.where(node_numbers == int(node_number))[0]
+    if matches.size != 1:
+        raise ValueError(f"CFP node {node_number} could not be identified uniquely.")
+    node_idx = int(matches[0])
+    conduit_column = int(diagnostics["node_columns"][node_idx])
+    return node_idx, conduit_column
+
+
+def selected_tube_metadata(
+    diagnostics: dict,
+    tube_number: int,
+) -> tuple[int, int, int, int, int]:
+    """Return tube index plus begin/end node indices and node numbers."""
+    tube_numbers = np.asarray(diagnostics["tube_numbers"], dtype=int)
+    matches = np.where(tube_numbers == int(tube_number))[0]
+    if matches.size != 1:
+        raise ValueError(f"CFP tube {tube_number} could not be identified uniquely.")
+    tube_idx = int(matches[0])
+    begin_node = int(np.asarray(diagnostics["tube_begin_nodes"], dtype=int)[tube_idx])
+    end_node = int(np.asarray(diagnostics["tube_end_nodes"], dtype=int)[tube_idx])
+    begin_idx, _ = selected_node_metadata(diagnostics, begin_node)
+    end_idx, _ = selected_node_metadata(diagnostics, end_node)
+    return tube_idx, begin_idx, end_idx, begin_node, end_node
+
+
+def adjacent_tubes_for_node(diagnostics: dict, node_number: int) -> dict[str, int]:
+    """Return the left/right tube connected to a conduit node.
+
+    ``Left`` and ``Right`` are defined geometrically from the x coordinate of the
+    other end node, so the UI remains correct even if CFP tube numbering changes.
+    End nodes naturally expose only one option.
+    """
+    node_idx, _ = selected_node_metadata(diagnostics, int(node_number))
+    node_x = np.asarray(diagnostics["node_x"], dtype=float)
+    x0 = float(node_x[node_idx])
+    begin = np.asarray(diagnostics["tube_begin_nodes"], dtype=int)
+    end = np.asarray(diagnostics["tube_end_nodes"], dtype=int)
+    tube_numbers = np.asarray(diagnostics["tube_numbers"], dtype=int)
+
+    connected = np.where((begin == int(node_number)) | (end == int(node_number)))[0]
+    if connected.size == 0:
+        raise ValueError(f"CFP node {node_number} is not connected to a conduit tube.")
+
+    choices: dict[str, int] = {}
+    for tube_idx in connected:
+        b = int(begin[tube_idx])
+        e = int(end[tube_idx])
+        other_node = e if b == int(node_number) else b
+        other_idx, _ = selected_node_metadata(diagnostics, other_node)
+        other_x = float(node_x[other_idx])
+        if other_x < x0:
+            choices["Left"] = int(tube_numbers[tube_idx])
+        elif other_x > x0:
+            choices["Right"] = int(tube_numbers[tube_idx])
+        else:
+            # The teaching network is horizontal, but retain a deterministic
+            # fallback in case a future network contains equal-x connected nodes.
+            key = "Left" if other_node < int(node_number) else "Right"
+            choices[key] = int(tube_numbers[tube_idx])
+
+    # Keep the intuitive order in radio buttons.
+    return {side: choices[side] for side in ("Left", "Right") if side in choices}
+
+
+def default_tube_side(diagnostics: dict, node_number: int) -> str:
+    """Choose a stable default adjacent-tube side for a node."""
+    choices = adjacent_tubes_for_node(diagnostics, int(node_number))
+    if "Right" in choices:
+        return "Right"
+    return next(iter(choices))
+
+
+def _tube_profile_geometry(
+    diagnostics: dict,
+    tube_number: int,
+) -> tuple[float, float, int, int]:
+    """Return distances of the two nodes connected by a selected tube."""
+    _, begin_idx, end_idx, begin_node, end_node = selected_tube_metadata(
+        diagnostics, tube_number
+    )
+    node_x = np.asarray(diagnostics["node_x"], dtype=float)
+    distance = node_x - node_x[0]
+    return (
+        float(distance[begin_idx]),
+        float(distance[end_idx]),
+        begin_node,
+        end_node,
+    )
+
+
+# =============================================================================
+# 4. PLOTTING AND DIAGNOSTIC VISUALIZATION
+# =============================================================================
+# -----------------------------------------------------------------------------
+# 4.1 Common plotting, scale, and formatting helpers
+# -----------------------------------------------------------------------------
+def format_elapsed_time(seconds: float) -> str:
+    """Compact time label for profile controls."""
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    if seconds < 3600:
+        return f"{seconds / 60.0:.1f} min"
+    return f"{seconds / 3600.0:.2f} h"
 
 
 def _finite_head_values(values: np.ndarray) -> np.ndarray:
@@ -1441,17 +1935,95 @@ def _head_tick_decimals(ticks: np.ndarray) -> int:
     return 3
 
 
-def selected_node_metadata(diagnostics: dict, node_number: int) -> tuple[int, int]:
-    """Return zero-based node index and one-based MODFLOW column for a CFP node."""
-    node_numbers = np.asarray(diagnostics["node_numbers"], dtype=int)
-    matches = np.where(node_numbers == int(node_number))[0]
-    if matches.size != 1:
-        raise ValueError(f"CFP node {node_number} could not be identified uniquely.")
-    node_idx = int(matches[0])
-    conduit_column = int(diagnostics["node_columns"][node_idx])
-    return node_idx, conduit_column
+def _finite_flow_values(values: np.ndarray) -> np.ndarray:
+    """Return finite CFP flow values."""
+    array = np.asarray(values, dtype=float)
+    return array[np.isfinite(array)]
 
 
+def global_exchange_flow_limit(diagnostics: dict) -> float:
+    """Rounded symmetric full-run limit for signed matrix-conduit exchange flow."""
+    values = _finite_flow_values(diagnostics["exchange_flow"])
+    if values.size == 0:
+        raise ValueError("The exchange-flow results contain no valid values.")
+    observed = float(np.max(np.abs(values)))
+    if observed <= 0.0:
+        return 1.0e-12
+    step = _nice_numeric_step(observed, target_intervals=8)
+    return float(np.ceil(observed / step) * step)
+
+
+def flow_ceiling_slider_settings(observed_maximum: float) -> tuple[float, float, float]:
+    """Return minimum, default maximum and step for conduit-flow ceiling slider."""
+    observed_maximum = float(observed_maximum)
+    if not np.isfinite(observed_maximum) or observed_maximum <= 0.0:
+        return 1.0e-8, 1.0e-7, 1.0e-8
+
+    step = _nice_numeric_step(observed_maximum, target_intervals=40)
+    default_max = float(np.ceil(observed_maximum / step) * step)
+    # Let the user zoom substantially while preventing a zero-height axis.
+    min_ceiling = float(max(step, default_max / 20.0))
+    min_ceiling = float(np.ceil(min_ceiling / step) * step)
+    if min_ceiling >= default_max:
+        min_ceiling = step
+    return min_ceiling, default_max, step
+
+
+def _scenario_labels(scenarios: list[dict]) -> dict[int, str]:
+    """Return unambiguous display labels keyed by execution number."""
+    counts: dict[str, int] = {}
+    for scenario in scenarios:
+        counts[scenario["name"]] = counts.get(scenario["name"], 0) + 1
+    labels: dict[int, str] = {}
+    for scenario in scenarios:
+        label = scenario["name"]
+        if counts[label] > 1:
+            label = f"{label} (execution {scenario['execution_number']})"
+        labels[int(scenario["execution_number"])] = label
+    return labels
+
+
+def _nearest_diagnostic_time_index(diagnostics: dict, target_time: float) -> int:
+    times = np.asarray(diagnostics["times"], dtype=float)
+    return int(np.argmin(np.abs(times - float(target_time))))
+
+
+def _conduit_flow_profile_data(
+    diagnostics: dict,
+    time_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return outlet boundary, actual tube Q values, and inlet boundary as one profile."""
+    node_x = np.asarray(diagnostics["node_x"], dtype=float)
+    outlet_x = float(node_x[0])
+    inlet_x = float(node_x[-1])
+    tube_mid_x = np.asarray(diagnostics["tube_mid_x"], dtype=float)
+    tube_q = np.abs(np.asarray(diagnostics["tube_flow"][time_index, :], dtype=float))
+    spring_q = float(np.asarray(diagnostics["spring_outflow"], dtype=float)[time_index])
+    direct_q = float(
+        np.asarray(diagnostics["direct_recharge_total"], dtype=float)[time_index]
+    )
+
+    x = np.concatenate(([outlet_x], tube_mid_x, [inlet_x])) - outlet_x
+    q = np.concatenate(([spring_q], tube_q, [direct_q]))
+    return x, q
+
+
+def global_conduit_flow_max(diagnostics: dict) -> float:
+    """Maximum of actual tube flow and the two external conduit boundary fluxes."""
+    arrays = [
+        np.abs(np.asarray(diagnostics["tube_flow"], dtype=float)).ravel(),
+        np.asarray(diagnostics["spring_outflow"], dtype=float).ravel(),
+        np.asarray(diagnostics["direct_recharge_total"], dtype=float).ravel(),
+    ]
+    values = np.concatenate([a[np.isfinite(a)] for a in arrays if a.size])
+    if values.size == 0:
+        raise ValueError("The conduit-flow results contain no valid values.")
+    return float(np.max(values))
+
+
+# -----------------------------------------------------------------------------
+# 4.2 Spring-response comparison
+# -----------------------------------------------------------------------------
 def make_comparison_plot(
     scenarios: list[dict],
     time_unit: str,
@@ -1493,165 +2065,9 @@ def make_comparison_plot(
     return fig
 
 
-def make_longitudinal_head_plot(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    head_ylim: tuple[float, float],
-):
-    """Plot conduit and co-located matrix head along the conduit."""
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    distance = node_x - node_x[0]
-    node_idx, _ = selected_node_metadata(diagnostics, selected_node)
-
-    conduit_values = np.asarray(diagnostics["conduit_heads"][time_index, :], dtype=float)
-    matrix_values = np.asarray(
-        diagnostics["matrix_heads_at_nodes"][time_index, :], dtype=float
-    )
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(
-        distance,
-        conduit_values,
-        linewidth=2.2,
-        marker="o",
-        markersize=3.5,
-        color=conduit_color,
-        label="Conduit head",
-    )
-    ax.plot(
-        distance,
-        matrix_values,
-        linewidth=2.0,
-        marker="o",
-        markersize=3.0,
-        color=MATRIX_HEAD_COLOR,
-        label="Matrix head at conduit cells",
-    )
-
-    # The shared conduit-node selection is shown explicitly so the user can
-    # relate this longitudinal section to the plan view and transient plot.
-    selected_distance = float(distance[node_idx])
-    ax.axvline(
-        selected_distance,
-        linestyle=":",
-        linewidth=1.6,
-        color=ring_color,
-        alpha=0.95,
-        label=f"Selected node {selected_node}",
-    )
-
-    # Inner point + larger open complementary ring.
-    ax.scatter(
-        [selected_distance],
-        [float(conduit_values[node_idx])],
-        s=62,
-        marker="o",
-        color=conduit_color,
-        edgecolors="white",
-        linewidths=0.8,
-        zorder=7,
-    )
-    ax.scatter(
-        [selected_distance],
-        [float(conduit_values[node_idx])],
-        s=150,
-        marker="o",
-        facecolors="none",
-        edgecolors=ring_color,
-        linewidths=2.4,
-        zorder=8,
-    )
-    ax.scatter(
-        [selected_distance],
-        [float(matrix_values[node_idx])],
-        s=58,
-        marker="s",
-        color=MATRIX_HEAD_COLOR,
-        edgecolors="white",
-        linewidths=0.8,
-        zorder=7,
-    )
-
-    ax.set_title(f"Heads along conduit — selected node {selected_node}")
-    ax.set_xlabel("Distance along conduit from outlet [m]")
-    ax.set_ylabel("Hydraulic head [m]")
-    ax.set_ylim(*head_ylim)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-def make_perpendicular_head_plot(
-    diagnostics: dict,
-    time_index: int,
-    selected_node: int,
-    conduit_color: str,
-    head_ylim: tuple[float, float],
-):
-    """Plot the matrix-head transect perpendicular to the selected conduit node."""
-    node_idx, conduit_column = selected_node_metadata(diagnostics, selected_node)
-    conduit_y = float(diagnostics["node_y"][node_idx])
-    y_distance = np.asarray(diagnostics["y_centers"], dtype=float) - conduit_y
-
-    matrix_profile = np.asarray(
-        diagnostics["matrix_heads"][time_index, :, conduit_column - 1],
-        dtype=float,
-    )
-    conduit_head = float(diagnostics["conduit_heads"][time_index, node_idx])
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(
-        y_distance,
-        matrix_profile,
-        linewidth=2.0,
-        marker="o",
-        markersize=3.0,
-        color=MATRIX_HEAD_COLOR,
-        label="Matrix head",
-    )
-    ax.scatter(
-        [0.0],
-        [conduit_head],
-        s=64,
-        marker="o",
-        color=conduit_color,
-        edgecolors="white",
-        linewidths=0.8,
-        label=f"Conduit head, node {selected_node}",
-        zorder=7,
-    )
-    ax.scatter(
-        [0.0],
-        [conduit_head],
-        s=155,
-        marker="o",
-        facecolors="none",
-        edgecolors=ring_color,
-        linewidths=2.4,
-        zorder=8,
-    )
-    ax.axvline(
-        0.0,
-        linestyle="--",
-        linewidth=1.2,
-        color=ring_color,
-        alpha=0.9,
-    )
-    ax.set_title(f"Perpendicular profile through conduit node {selected_node}")
-    ax.set_xlabel("Distance perpendicular to conduit [m]")
-    ax.set_ylabel("Hydraulic head [m]")
-    ax.set_ylim(*head_ylim)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
+# -----------------------------------------------------------------------------
+# 4.3 Head diagnostics
+# -----------------------------------------------------------------------------
 def make_plan_view_head_plot(
     diagnostics: dict,
     time_index: int,
@@ -1817,598 +2233,6 @@ def make_plan_view_head_plot(
     return fig
 
 
-def make_node_head_timeseries_plot(
-    diagnostics: dict,
-    node_number: int,
-    conduit_color: str,
-    selected_time_index: int,
-    head_ylim: tuple[float, float],
-):
-    """Plot conduit and co-located matrix head through time for one CFP node."""
-    node_idx, _ = selected_node_metadata(diagnostics, node_number)
-    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-    conduit_values = np.asarray(diagnostics["conduit_heads"][:, node_idx], dtype=float)
-    matrix_values = np.asarray(
-        diagnostics["matrix_heads_at_nodes"][:, node_idx], dtype=float
-    )
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(
-        times_h,
-        conduit_values,
-        linewidth=2.2,
-        color=conduit_color,
-        label="Conduit head",
-    )
-    ax.plot(
-        times_h,
-        matrix_values,
-        linewidth=2.0,
-        color=MATRIX_HEAD_COLOR,
-        label="Matrix head at conduit cell",
-    )
-
-    # The common time selection is not needed to define this transient plot,
-    # but marking it makes the relationship to sections 1 and 2 immediately clear.
-    selected_time_h = float(times_h[selected_time_index])
-    ax.axvline(
-        selected_time_h,
-        linestyle=":",
-        linewidth=1.5,
-        color=ring_color,
-        alpha=0.95,
-        label="Selected diagnostic time",
-    )
-    ax.scatter(
-        [selected_time_h],
-        [float(conduit_values[selected_time_index])],
-        s=62,
-        marker="o",
-        color=conduit_color,
-        edgecolors="white",
-        linewidths=0.8,
-        zorder=7,
-    )
-    ax.scatter(
-        [selected_time_h],
-        [float(conduit_values[selected_time_index])],
-        s=150,
-        marker="o",
-        facecolors="none",
-        edgecolors=ring_color,
-        linewidths=2.4,
-        zorder=8,
-    )
-    ax.scatter(
-        [selected_time_h],
-        [float(matrix_values[selected_time_index])],
-        s=58,
-        marker="s",
-        color=MATRIX_HEAD_COLOR,
-        edgecolors="white",
-        linewidths=0.8,
-        zorder=7,
-    )
-
-    ax.set_title(f"Transient heads at conduit node {node_number}")
-    ax.set_xlabel("Time [h]")
-    ax.set_ylabel("Hydraulic head [m]")
-    ax.set_ylim(*head_ylim)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-
-def _finite_flow_values(values: np.ndarray) -> np.ndarray:
-    """Return finite CFP flow values."""
-    array = np.asarray(values, dtype=float)
-    return array[np.isfinite(array)]
-
-
-def global_conduit_flow_max(diagnostics: dict) -> float:
-    """Maximum representative conduit-flow magnitude over the complete run."""
-    values = _finite_flow_values(diagnostics["node_conduit_flow"])
-    if values.size == 0:
-        raise ValueError("The conduit-flow results contain no valid values.")
-    return float(np.max(np.abs(values)))
-
-
-def global_exchange_flow_limit(diagnostics: dict) -> float:
-    """Rounded symmetric full-run limit for signed matrix-conduit exchange flow."""
-    values = _finite_flow_values(diagnostics["exchange_flow"])
-    if values.size == 0:
-        raise ValueError("The exchange-flow results contain no valid values.")
-    observed = float(np.max(np.abs(values)))
-    if observed <= 0.0:
-        return 1.0e-12
-    step = _nice_numeric_step(observed, target_intervals=8)
-    return float(np.ceil(observed / step) * step)
-
-
-def flow_ceiling_slider_settings(observed_maximum: float) -> tuple[float, float, float]:
-    """Return minimum, default maximum and step for conduit-flow ceiling slider."""
-    observed_maximum = float(observed_maximum)
-    if not np.isfinite(observed_maximum) or observed_maximum <= 0.0:
-        return 1.0e-8, 1.0e-7, 1.0e-8
-
-    step = _nice_numeric_step(observed_maximum, target_intervals=40)
-    default_max = float(np.ceil(observed_maximum / step) * step)
-    # Let the user zoom substantially while preventing a zero-height axis.
-    min_ceiling = float(max(step, default_max / 20.0))
-    min_ceiling = float(np.ceil(min_ceiling / step) * step)
-    if min_ceiling >= default_max:
-        min_ceiling = step
-    return min_ceiling, default_max, step
-
-
-def make_conduit_flow_profile_plot(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    flow_max: float,
-):
-    """Plot representative conduit-flow magnitude along the conduit nodes."""
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    distance = node_x - node_x[0]
-    node_idx, _ = selected_node_metadata(diagnostics, selected_node)
-    values = np.asarray(diagnostics["node_conduit_flow"][time_index, :], dtype=float)
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(
-        distance,
-        values,
-        linewidth=2.2,
-        marker="o",
-        markersize=3.5,
-        color=conduit_color,
-        label="Conduit flow at node",
-    )
-    selected_distance = float(distance[node_idx])
-    selected_value = float(values[node_idx])
-    ax.axvline(
-        selected_distance,
-        linestyle=":",
-        linewidth=1.5,
-        color=ring_color,
-        alpha=0.95,
-    )
-    ax.scatter(
-        [selected_distance],
-        [selected_value],
-        s=62,
-        color=conduit_color,
-        edgecolors="white",
-        linewidths=0.8,
-        zorder=7,
-    )
-    ax.scatter(
-        [selected_distance],
-        [selected_value],
-        s=150,
-        facecolors="none",
-        edgecolors=ring_color,
-        linewidths=2.4,
-        label=f"Selected node {selected_node}",
-        zorder=8,
-    )
-    ax.set_title(f"Conduit flow along the conduit — selected node {selected_node}")
-    ax.set_xlabel("Distance along conduit from outlet [m]")
-    ax.set_ylabel("Conduit flow [m³/s]")
-    ax.set_ylim(0.0, float(flow_max))
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-def make_exchange_flow_profile_plot(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    exchange_limit: float,
-):
-    """Plot signed CFP matrix-conduit exchange flow along conduit nodes."""
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    distance = node_x - node_x[0]
-    node_idx, _ = selected_node_metadata(diagnostics, selected_node)
-    values = np.asarray(diagnostics["exchange_flow"][time_index, :], dtype=float)
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(
-        distance,
-        values,
-        linewidth=2.0,
-        marker="o",
-        markersize=3.5,
-        color=MATRIX_HEAD_COLOR,
-        label="Matrix–conduit exchange (CFP sign)",
-    )
-    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
-    selected_distance = float(distance[node_idx])
-    selected_value = float(values[node_idx])
-    ax.axvline(
-        selected_distance,
-        linestyle=":",
-        linewidth=1.5,
-        color=ring_color,
-        alpha=0.95,
-    )
-    ax.scatter(
-        [selected_distance],
-        [selected_value],
-        s=58,
-        color=MATRIX_HEAD_COLOR,
-        edgecolors="white",
-        linewidths=0.8,
-        zorder=7,
-    )
-    ax.scatter(
-        [selected_distance],
-        [selected_value],
-        s=150,
-        facecolors="none",
-        edgecolors=ring_color,
-        linewidths=2.4,
-        label=f"Selected node {selected_node}",
-        zorder=8,
-    )
-    ax.set_title(f"Matrix–conduit exchange along conduit — node {selected_node}")
-    ax.set_xlabel("Distance along conduit from outlet [m]")
-    ax.set_ylabel("Exchange flow [m³/s]")
-    ax.set_ylim(-float(exchange_limit), float(exchange_limit))
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-def make_node_conduit_flow_timeseries_plot(
-    diagnostics: dict,
-    node_number: int,
-    conduit_color: str,
-    selected_time_index: int,
-    flow_max: float,
-):
-    """Plot representative conduit-flow magnitude through time at one node."""
-    node_idx, _ = selected_node_metadata(diagnostics, node_number)
-    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-    values = np.asarray(diagnostics["node_conduit_flow"][:, node_idx], dtype=float)
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(times_h, values, linewidth=2.2, color=conduit_color, label="Conduit flow")
-    selected_time_h = float(times_h[selected_time_index])
-    selected_value = float(values[selected_time_index])
-    ax.axvline(
-        selected_time_h,
-        linestyle=":",
-        linewidth=1.5,
-        color=ring_color,
-        alpha=0.95,
-        label="Selected diagnostic time",
-    )
-    ax.scatter(
-        [selected_time_h], [selected_value], s=62, color=conduit_color,
-        edgecolors="white", linewidths=0.8, zorder=7,
-    )
-    ax.scatter(
-        [selected_time_h], [selected_value], s=150, facecolors="none",
-        edgecolors=ring_color, linewidths=2.4, zorder=8,
-    )
-    ax.set_title(f"Transient conduit flow at node {node_number}")
-    ax.set_xlabel("Time [h]")
-    ax.set_ylabel("Conduit flow [m³/s]")
-    ax.set_ylim(0.0, float(flow_max))
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-def make_node_exchange_flow_timeseries_plot(
-    diagnostics: dict,
-    node_number: int,
-    conduit_color: str,
-    selected_time_index: int,
-    exchange_limit: float,
-):
-    """Plot signed matrix-conduit exchange flow through time at one CFP node."""
-    node_idx, _ = selected_node_metadata(diagnostics, node_number)
-    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-    values = np.asarray(diagnostics["exchange_flow"][:, node_idx], dtype=float)
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    ax.plot(
-        times_h,
-        values,
-        linewidth=2.0,
-        color=MATRIX_HEAD_COLOR,
-        label="Matrix–conduit exchange (CFP sign)",
-    )
-    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
-    selected_time_h = float(times_h[selected_time_index])
-    selected_value = float(values[selected_time_index])
-    ax.axvline(
-        selected_time_h,
-        linestyle=":",
-        linewidth=1.5,
-        color=ring_color,
-        alpha=0.95,
-        label="Selected diagnostic time",
-    )
-    ax.scatter(
-        [selected_time_h], [selected_value], s=58, color=MATRIX_HEAD_COLOR,
-        edgecolors="white", linewidths=0.8, zorder=7,
-    )
-    ax.scatter(
-        [selected_time_h], [selected_value], s=150, facecolors="none",
-        edgecolors=ring_color, linewidths=2.4, zorder=8,
-    )
-    ax.set_title(f"Transient matrix–conduit exchange at node {node_number}")
-    ax.set_xlabel("Time [h]")
-    ax.set_ylabel("Exchange flow [m³/s]")
-    ax.set_ylim(-float(exchange_limit), float(exchange_limit))
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-def _scenario_labels(scenarios: list[dict]) -> dict[int, str]:
-    """Return unambiguous display labels keyed by execution number."""
-    counts: dict[str, int] = {}
-    for scenario in scenarios:
-        counts[scenario["name"]] = counts.get(scenario["name"], 0) + 1
-    labels: dict[int, str] = {}
-    for scenario in scenarios:
-        label = scenario["name"]
-        if counts[label] > 1:
-            label = f"{label} (execution {scenario['execution_number']})"
-        labels[int(scenario["execution_number"])] = label
-    return labels
-
-
-def _nearest_diagnostic_time_index(diagnostics: dict, target_time: float) -> int:
-    times = np.asarray(diagnostics["times"], dtype=float)
-    return int(np.argmin(np.abs(times - float(target_time))))
-
-
-def make_head_profile_comparison_plot(
-    scenarios: list[dict], target_time: float, node_number: int
-):
-    """Compare longitudinal conduit and co-located matrix heads across runs."""
-    fig, ax = plt.subplots(figsize=(9.5, 5.2))
-    labels = _scenario_labels(scenarios)
-    all_values: list[np.ndarray] = []
-
-    for scenario in scenarios:
-        diagnostics = scenario["diagnostics"]
-        idx = _nearest_diagnostic_time_index(diagnostics, target_time)
-        node_x = np.asarray(diagnostics["node_x"], dtype=float)
-        distance = node_x - node_x[0]
-        conduit = np.asarray(diagnostics["conduit_heads"][idx, :], dtype=float)
-        matrix = np.asarray(diagnostics["matrix_heads_at_nodes"][idx, :], dtype=float)
-        label = labels[int(scenario["execution_number"])]
-        ax.plot(distance, conduit, linewidth=2.1, color=scenario["color"], label=f"{label} — conduit")
-        ax.plot(distance, matrix, linewidth=1.8, linestyle="--", color=scenario["color"], alpha=0.8, label=f"{label} — matrix")
-        all_values.extend([conduit, matrix])
-
-    # Shared selected-node marker by position; all model geometries are identical.
-    first_d = scenarios[0]["diagnostics"]
-    node_idx, _ = selected_node_metadata(first_d, node_number)
-    first_dist = np.asarray(first_d["node_x"], dtype=float) - float(first_d["node_x"][0])
-    ax.axvline(float(first_dist[node_idx]), linestyle=":", linewidth=1.3, color=REFERENCE_COLOR)
-    ax.set_title(f"Stored runs — heads along conduit at t = {format_elapsed_time(target_time)}")
-    ax.set_xlabel("Distance along conduit from outlet [m]")
-    ax.set_ylabel("Hydraulic head [m]")
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize=8)
-    fig.tight_layout()
-    return fig
-
-
-def make_head_timeseries_comparison_plot(scenarios: list[dict], node_number: int):
-    """Compare transient conduit/matrix heads at the selected node across runs."""
-    fig, ax = plt.subplots(figsize=(9.5, 5.2))
-    labels = _scenario_labels(scenarios)
-    for scenario in scenarios:
-        diagnostics = scenario["diagnostics"]
-        node_idx, _ = selected_node_metadata(diagnostics, node_number)
-        times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-        conduit = np.asarray(diagnostics["conduit_heads"][:, node_idx], dtype=float)
-        matrix = np.asarray(diagnostics["matrix_heads_at_nodes"][:, node_idx], dtype=float)
-        label = labels[int(scenario["execution_number"])]
-        ax.plot(times_h, conduit, linewidth=2.1, color=scenario["color"], label=f"{label} — conduit")
-        ax.plot(times_h, matrix, linewidth=1.8, linestyle="--", color=scenario["color"], alpha=0.8, label=f"{label} — matrix")
-    ax.set_title(f"Stored runs — transient heads at conduit node {node_number}")
-    ax.set_xlabel("Time [h]")
-    ax.set_ylabel("Hydraulic head [m]")
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize=8)
-    fig.tight_layout()
-    return fig
-
-
-def make_flow_profile_comparison_plots(
-    scenarios: list[dict], target_time: float, node_number: int
-):
-    """Compare conduit-flow and exchange-flow profiles across stored runs."""
-    labels = _scenario_labels(scenarios)
-    fig_q, ax_q = plt.subplots(figsize=(9.5, 5.0))
-    fig_ex, ax_ex = plt.subplots(figsize=(9.5, 5.0))
-
-    for scenario in scenarios:
-        diagnostics = scenario["diagnostics"]
-        idx = _nearest_diagnostic_time_index(diagnostics, target_time)
-        distance = np.asarray(diagnostics["node_x"], dtype=float) - float(diagnostics["node_x"][0])
-        q = np.asarray(diagnostics["node_conduit_flow"][idx, :], dtype=float)
-        ex = np.asarray(diagnostics["exchange_flow"][idx, :], dtype=float)
-        label = labels[int(scenario["execution_number"])]
-        ax_q.plot(distance, q, linewidth=2.1, color=scenario["color"], label=label)
-        ax_ex.plot(distance, ex, linewidth=2.1, color=scenario["color"], label=label)
-
-    first_d = scenarios[0]["diagnostics"]
-    node_idx, _ = selected_node_metadata(first_d, node_number)
-    first_dist = np.asarray(first_d["node_x"], dtype=float) - float(first_d["node_x"][0])
-    selected_distance = float(first_dist[node_idx])
-    for ax in (ax_q, ax_ex):
-        ax.axvline(selected_distance, linestyle=":", linewidth=1.3, color=REFERENCE_COLOR)
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
-    ax_ex.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
-
-    ax_q.set_title(f"Stored runs — conduit flow along conduit at t = {format_elapsed_time(target_time)}")
-    ax_q.set_xlabel("Distance along conduit from outlet [m]")
-    ax_q.set_ylabel("Conduit flow [m³/s]")
-    ax_q.set_ylim(bottom=0.0)
-    fig_q.tight_layout()
-
-    ax_ex.set_title(f"Stored runs — matrix–conduit exchange at t = {format_elapsed_time(target_time)}")
-    ax_ex.set_xlabel("Distance along conduit from outlet [m]")
-    ax_ex.set_ylabel("Exchange flow [m³/s]")
-    fig_ex.tight_layout()
-    return fig_q, fig_ex
-
-
-def make_flow_timeseries_comparison_plots(scenarios: list[dict], node_number: int):
-    """Compare transient conduit and exchange flow at one node across stored runs."""
-    labels = _scenario_labels(scenarios)
-    fig_q, ax_q = plt.subplots(figsize=(9.5, 5.0))
-    fig_ex, ax_ex = plt.subplots(figsize=(9.5, 5.0))
-
-    for scenario in scenarios:
-        diagnostics = scenario["diagnostics"]
-        node_idx, _ = selected_node_metadata(diagnostics, node_number)
-        times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-        q = np.asarray(diagnostics["node_conduit_flow"][:, node_idx], dtype=float)
-        ex = np.asarray(diagnostics["exchange_flow"][:, node_idx], dtype=float)
-        label = labels[int(scenario["execution_number"])]
-        ax_q.plot(times_h, q, linewidth=2.1, color=scenario["color"], label=label)
-        ax_ex.plot(times_h, ex, linewidth=2.1, color=scenario["color"], label=label)
-
-    ax_q.set_title(f"Stored runs — transient conduit flow at node {node_number}")
-    ax_q.set_xlabel("Time [h]")
-    ax_q.set_ylabel("Conduit flow [m³/s]")
-    ax_q.set_ylim(bottom=0.0)
-    ax_q.grid(True, alpha=0.3)
-    ax_q.legend(fontsize=8)
-    fig_q.tight_layout()
-
-    ax_ex.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
-    ax_ex.set_title(f"Stored runs — transient matrix–conduit exchange at node {node_number}")
-    ax_ex.set_xlabel("Time [h]")
-    ax_ex.set_ylabel("Exchange flow [m³/s]")
-    ax_ex.grid(True, alpha=0.3)
-    ax_ex.legend(fontsize=8)
-    fig_ex.tight_layout()
-    return fig_q, fig_ex
-
-
-def _budget_plot_data(budget: dict) -> tuple[list[str], np.ndarray]:
-    """Return requested whole-system budget categories using a source/sink sign convention."""
-    labels = [
-        "Diffuse\nrecharge",
-        "Direct\nrecharge",
-        "Matrix storage\nchange",
-        "Matrix boundary\noutflow",
-        "Karst conduit\noutflow",
-    ]
-    # Positive = source to the combined matrix/conduit system. A positive matrix
-    # storage change means water was accumulated in matrix storage and is therefore
-    # shown as a sink (negative plotted value). Storage release appears positive.
-    values = np.asarray(
-        [
-            float(budget["diffuse_recharge"]),
-            float(budget["direct_recharge"]),
-            -float(budget["matrix_storage_change"]),
-            -float(budget["matrix_boundary_outflow"]),
-            -float(budget["karst_conduit_outflow"]),
-        ],
-        dtype=float,
-    )
-    return labels, values
-
-
-def make_cumulative_budget_plot(run: dict):
-    """Plot the requested cumulative whole-run budget for one model execution."""
-    budget = run.get("budget")
-    if budget is None:
-        raise ValueError("No cumulative budget is available for this run.")
-    labels, values = _budget_plot_data(budget)
-
-    fig, ax = plt.subplots(figsize=(9.5, 5.1))
-    x = np.arange(len(labels))
-    bars = ax.bar(x, values, width=0.68, color=run["color"], alpha=0.88)
-    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Cumulative water volume [m³]")
-    ax.set_title("Cumulative water budget — complete simulation")
-    ax.grid(True, axis="y", alpha=0.25)
-
-    finite = values[np.isfinite(values)]
-    if finite.size:
-        span = max(float(np.max(np.abs(finite))), 1.0)
-        offset = 0.018 * span
-        for bar, value in zip(bars, values):
-            va = "bottom" if value >= 0.0 else "top"
-            y = float(value + offset if value >= 0.0 else value - offset)
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                y,
-                f"{value:,.1f}",
-                ha="center",
-                va=va,
-                fontsize=8.5,
-            )
-        ax.margins(y=0.14)
-
-    fig.tight_layout()
-    return fig
-
-
-def make_budget_comparison_plot(scenarios: list[dict]):
-    """Compare cumulative whole-run budgets while retaining each run's color."""
-    if not scenarios:
-        raise ValueError("No runs were supplied for budget comparison.")
-
-    labels, _ = _budget_plot_data(scenarios[0]["budget"])
-    x = np.arange(len(labels), dtype=float)
-    n = len(scenarios)
-    width = min(0.16, 0.78 / max(n, 1))
-    offsets = (np.arange(n) - 0.5 * (n - 1)) * width
-
-    fig, ax = plt.subplots(figsize=(10.5, 5.6))
-    for offset, scenario in zip(offsets, scenarios):
-        _, values = _budget_plot_data(scenario["budget"])
-        ax.bar(
-            x + offset,
-            values,
-            width=width,
-            color=scenario["color"],
-            alpha=0.88,
-            label=scenario["name"],
-        )
-
-    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Cumulative water volume [m³]")
-    ax.set_title("Cumulative water-budget comparison")
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
 def make_plan_view_head_plot_v6(
     diagnostics: dict,
     time_index: int,
@@ -2464,6 +2288,50 @@ def make_plan_view_head_plot_v6(
         label=f"Comparison node {comparison_node}",
         zorder=9,
     )
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+
+def make_plan_view_head_plot_v7(
+    diagnostics: dict,
+    time_index: int,
+    conduit_color: str,
+    selected_node: int,
+    selected_tube: int,
+    matrix_head_max: float,
+    comparison_node: int | None = None,
+    comparison_tube: int | None = None,
+):
+    """Plan view with node-centered tube selections."""
+    fig = make_plan_view_head_plot_v6(
+        diagnostics,
+        time_index,
+        conduit_color=conduit_color,
+        selected_node=selected_node,
+        matrix_head_max=matrix_head_max,
+        comparison_node=comparison_node,
+    )
+    ax = fig.axes[0]
+    _draw_tube_symbol_plan(
+        ax,
+        diagnostics,
+        int(selected_tube),
+        color=complementary_color(conduit_color),
+        label=f"Selected tube {selected_tube}",
+        selected_node=int(selected_node),
+    )
+    if comparison_tube is not None and int(comparison_tube) != int(selected_tube):
+        _draw_tube_symbol_plan(
+            ax,
+            diagnostics,
+            int(comparison_tube),
+            color=COMPARISON_REFERENCE_COLOR,
+            label=f"Comparison tube {comparison_tube}",
+            selected_node=(int(comparison_node) if comparison_node is not None else None),
+            linestyle="--",
+            alpha=0.9,
+        )
     ax.legend(loc="best")
     fig.tight_layout()
     return fig
@@ -2647,445 +2515,65 @@ def make_node_head_timeseries_plot_v6(
     return fig
 
 
-def make_conduit_flow_profile_plot_v6(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    flow_max: float,
-    comparison_time_index: int | None = None,
-    comparison_node: int | None = None,
+def make_head_profile_comparison_plot(
+    scenarios: list[dict], target_time: float, node_number: int
 ):
-    """Plot representative conduit flow along the conduit for one or two times."""
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    distance = node_x - node_x[0]
-    base_idx, _ = selected_node_metadata(diagnostics, selected_node)
-    base = np.asarray(diagnostics["node_conduit_flow"][time_index, :], dtype=float)
-    base_time = float(diagnostics["times"][time_index])
-    ring_color = complementary_color(conduit_color)
+    """Compare longitudinal conduit and co-located matrix heads across runs."""
+    fig, ax = plt.subplots(figsize=(9.5, 5.2))
+    labels = _scenario_labels(scenarios)
+    all_values: list[np.ndarray] = []
 
-    fig, ax = plt.subplots(figsize=(9.5, 4.9))
-    ax.plot(distance, base, linewidth=2.2, color=conduit_color,
-            label=f"Conduit flow — {format_elapsed_time(base_time)}")
-    base_x = float(distance[base_idx])
-    ax.scatter([base_x], [float(base[base_idx])], s=150, facecolors="none",
-               edgecolors=ring_color, linewidths=2.4,
-               label=f"Base node {selected_node}", zorder=8)
+    for scenario in scenarios:
+        diagnostics = scenario["diagnostics"]
+        idx = _nearest_diagnostic_time_index(diagnostics, target_time)
+        node_x = np.asarray(diagnostics["node_x"], dtype=float)
+        distance = node_x - node_x[0]
+        conduit = np.asarray(diagnostics["conduit_heads"][idx, :], dtype=float)
+        matrix = np.asarray(diagnostics["matrix_heads_at_nodes"][idx, :], dtype=float)
+        label = labels[int(scenario["execution_number"])]
+        ax.plot(distance, conduit, linewidth=2.1, color=scenario["color"], label=f"{label} — conduit")
+        ax.plot(distance, matrix, linewidth=1.8, linestyle="--", color=scenario["color"], alpha=0.8, label=f"{label} — matrix")
+        all_values.extend([conduit, matrix])
 
-    if comparison_time_index is not None:
-        compare = np.asarray(
-            diagnostics["node_conduit_flow"][comparison_time_index, :], dtype=float
-        )
-        compare_time = float(diagnostics["times"][comparison_time_index])
-        ax.plot(distance, compare, linewidth=2.2, linestyle="--", color=conduit_color,
-                alpha=0.78, label=f"Conduit flow — {format_elapsed_time(compare_time)} (comparison)")
-        compare_node_value = int(comparison_node if comparison_node is not None else selected_node)
-        compare_idx, _ = selected_node_metadata(diagnostics, compare_node_value)
-        compare_x = float(distance[compare_idx])
-        ax.scatter([compare_x], [float(compare[compare_idx])], s=125, marker="D",
-                   facecolors="none", edgecolors=COMPARISON_REFERENCE_COLOR,
-                   linewidths=2.2, label=f"Comparison node {compare_node_value}", zorder=8)
-
-    ax.set_title("Conduit flow along the conduit")
+    # Shared selected-node marker by position; all model geometries are identical.
+    first_d = scenarios[0]["diagnostics"]
+    node_idx, _ = selected_node_metadata(first_d, node_number)
+    first_dist = np.asarray(first_d["node_x"], dtype=float) - float(first_d["node_x"][0])
+    ax.axvline(float(first_dist[node_idx]), linestyle=":", linewidth=1.3, color=REFERENCE_COLOR)
+    ax.set_title(f"Stored runs — heads along conduit at t = {format_elapsed_time(target_time)}")
     ax.set_xlabel("Distance along conduit from outlet [m]")
-    ax.set_ylabel("Conduit flow [m³/s]")
-    ax.set_ylim(0.0, float(flow_max))
+    ax.set_ylabel("Hydraulic head [m]")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(ncol=2, fontsize=8)
     fig.tight_layout()
     return fig
 
 
-def make_exchange_flow_profile_plot_v6(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    exchange_limit: float,
-    comparison_time_index: int | None = None,
-    comparison_node: int | None = None,
-):
-    """Plot signed matrix-conduit exchange along the conduit for one or two times."""
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    distance = node_x - node_x[0]
-    base_idx, _ = selected_node_metadata(diagnostics, selected_node)
-    base = np.asarray(diagnostics["exchange_flow"][time_index, :], dtype=float)
-    base_time = float(diagnostics["times"][time_index])
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.9))
-    ax.plot(distance, base, linewidth=2.0, color=MATRIX_HEAD_COLOR,
-            label=f"Exchange — {format_elapsed_time(base_time)}")
-    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
-    base_x = float(distance[base_idx])
-    ax.scatter([base_x], [float(base[base_idx])], s=150, facecolors="none",
-               edgecolors=ring_color, linewidths=2.4,
-               label=f"Base node {selected_node}", zorder=8)
-
-    if comparison_time_index is not None:
-        compare = np.asarray(diagnostics["exchange_flow"][comparison_time_index, :], dtype=float)
-        compare_time = float(diagnostics["times"][comparison_time_index])
-        ax.plot(distance, compare, linewidth=2.0, linestyle="--", color=MATRIX_HEAD_COLOR,
-                alpha=0.62, label=f"Exchange — {format_elapsed_time(compare_time)} (comparison)")
-        compare_node_value = int(comparison_node if comparison_node is not None else selected_node)
-        compare_idx, _ = selected_node_metadata(diagnostics, compare_node_value)
-        compare_x = float(distance[compare_idx])
-        ax.scatter([compare_x], [float(compare[compare_idx])], s=125, marker="D",
-                   facecolors="none", edgecolors=COMPARISON_REFERENCE_COLOR,
-                   linewidths=2.2, label=f"Comparison node {compare_node_value}", zorder=8)
-
-    ax.set_title("Matrix–conduit exchange along the conduit")
-    ax.set_xlabel("Distance along conduit from outlet [m]")
-    ax.set_ylabel("Exchange flow [m³/s]")
-    ax.set_ylim(-float(exchange_limit), float(exchange_limit))
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-
-def make_node_conduit_flow_timeseries_plot_v6(
-    diagnostics: dict,
-    node_number: int,
-    conduit_color: str,
-    selected_time_index: int,
-    flow_max: float,
-    comparison_node: int | None = None,
-    comparison_time_index: int | None = None,
-):
-    """Plot transient representative conduit flow at one or two selected nodes."""
-    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-    base_idx, _ = selected_node_metadata(diagnostics, node_number)
-    base = np.asarray(diagnostics["node_conduit_flow"][:, base_idx], dtype=float)
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.9))
-    ax.plot(times_h, base, linewidth=2.2, color=conduit_color,
-            label=f"Conduit flow — node {node_number}")
-    base_t = float(times_h[selected_time_index])
-    ax.axvline(base_t, linestyle=":", linewidth=1.4, color=ring_color, alpha=0.9)
-    ax.scatter([base_t], [float(base[selected_time_index])], s=145, facecolors="none",
-               edgecolors=ring_color, linewidths=2.4, label="Base selection", zorder=8)
-
-    if comparison_node is not None:
-        compare_idx, _ = selected_node_metadata(diagnostics, int(comparison_node))
-        compare = np.asarray(diagnostics["node_conduit_flow"][:, compare_idx], dtype=float)
-        ax.plot(times_h, compare, linewidth=2.2, linestyle="--", color=conduit_color,
-                alpha=0.78, label=f"Conduit flow — node {comparison_node} (comparison)")
-        if comparison_time_index is not None:
-            compare_t = float(times_h[comparison_time_index])
-            ax.axvline(compare_t, linestyle="--", linewidth=1.2,
-                       color=COMPARISON_REFERENCE_COLOR, alpha=0.8)
-            ax.scatter([compare_t], [float(compare[comparison_time_index])], s=125,
-                       marker="D", facecolors="none", edgecolors=COMPARISON_REFERENCE_COLOR,
-                       linewidths=2.2, label="Comparison selection", zorder=8)
-
-    ax.set_title("Transient conduit flow at selected node(s)")
+def make_head_timeseries_comparison_plot(scenarios: list[dict], node_number: int):
+    """Compare transient conduit/matrix heads at the selected node across runs."""
+    fig, ax = plt.subplots(figsize=(9.5, 5.2))
+    labels = _scenario_labels(scenarios)
+    for scenario in scenarios:
+        diagnostics = scenario["diagnostics"]
+        node_idx, _ = selected_node_metadata(diagnostics, node_number)
+        times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
+        conduit = np.asarray(diagnostics["conduit_heads"][:, node_idx], dtype=float)
+        matrix = np.asarray(diagnostics["matrix_heads_at_nodes"][:, node_idx], dtype=float)
+        label = labels[int(scenario["execution_number"])]
+        ax.plot(times_h, conduit, linewidth=2.1, color=scenario["color"], label=f"{label} — conduit")
+        ax.plot(times_h, matrix, linewidth=1.8, linestyle="--", color=scenario["color"], alpha=0.8, label=f"{label} — matrix")
+    ax.set_title(f"Stored runs — transient heads at conduit node {node_number}")
     ax.set_xlabel("Time [h]")
-    ax.set_ylabel("Conduit flow [m³/s]")
-    ax.set_ylim(0.0, float(flow_max))
+    ax.set_ylabel("Hydraulic head [m]")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(ncol=2, fontsize=8)
     fig.tight_layout()
     return fig
 
 
-def make_node_exchange_flow_timeseries_plot_v6(
-    diagnostics: dict,
-    node_number: int,
-    conduit_color: str,
-    selected_time_index: int,
-    exchange_limit: float,
-    comparison_node: int | None = None,
-    comparison_time_index: int | None = None,
-):
-    """Plot transient signed exchange at one or two selected conduit nodes."""
-    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
-    base_idx, _ = selected_node_metadata(diagnostics, node_number)
-    base = np.asarray(diagnostics["exchange_flow"][:, base_idx], dtype=float)
-    ring_color = complementary_color(conduit_color)
-
-    fig, ax = plt.subplots(figsize=(9.5, 4.9))
-    ax.plot(times_h, base, linewidth=2.0, color=MATRIX_HEAD_COLOR,
-            label=f"Exchange — node {node_number}")
-    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
-    base_t = float(times_h[selected_time_index])
-    ax.axvline(base_t, linestyle=":", linewidth=1.4, color=ring_color, alpha=0.9)
-    ax.scatter([base_t], [float(base[selected_time_index])], s=145, facecolors="none",
-               edgecolors=ring_color, linewidths=2.4, label="Base selection", zorder=8)
-
-    if comparison_node is not None:
-        compare_idx, _ = selected_node_metadata(diagnostics, int(comparison_node))
-        compare = np.asarray(diagnostics["exchange_flow"][:, compare_idx], dtype=float)
-        ax.plot(times_h, compare, linewidth=2.0, linestyle="--", color=MATRIX_HEAD_COLOR,
-                alpha=0.62, label=f"Exchange — node {comparison_node} (comparison)")
-        if comparison_time_index is not None:
-            compare_t = float(times_h[comparison_time_index])
-            ax.axvline(compare_t, linestyle="--", linewidth=1.2,
-                       color=COMPARISON_REFERENCE_COLOR, alpha=0.8)
-            ax.scatter([compare_t], [float(compare[comparison_time_index])], s=125,
-                       marker="D", facecolors="none", edgecolors=COMPARISON_REFERENCE_COLOR,
-                       linewidths=2.2, label="Comparison selection", zorder=8)
-
-    ax.set_title("Transient matrix–conduit exchange at selected node(s)")
-    ax.set_xlabel("Time [h]")
-    ax.set_ylabel("Exchange flow [m³/s]")
-    ax.set_ylim(-float(exchange_limit), float(exchange_limit))
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
-def parameter_sets_equal(first: dict, second: dict) -> bool:
-    """Return True when two model-control dictionaries represent the same setup."""
-    if first.keys() != second.keys():
-        return False
-
-    for key in first:
-        a = first[key]
-        b = second[key]
-        if isinstance(a, (float, np.floating)) or isinstance(b, (float, np.floating)):
-            if not np.isclose(float(a), float(b), rtol=1.0e-12, atol=0.0):
-                return False
-        elif a != b:
-            return False
-    return True
-
-
-def store_run_in_rolling_history(run: dict) -> dict:
-    """Store a successful run in five cyclic, stable storage slots.
-
-    Visible names are user-editable. Slot identity is therefore kept separately
-    from the name so renaming a run can never break the rolling-history logic.
-    """
-    st.session_state.total_run_count += 1
-    execution_number = int(st.session_state.total_run_count)
-    slot_number = ((execution_number - 1) % MAX_STORED_RUNS) + 1
-    default_name = f"run{slot_number}"
-
-    stored_run = {
-        "name": default_name,
-        "slot_number": slot_number,
-        "color": RUN_COLORS[slot_number - 1],
-        "execution_number": execution_number,
-        **run,
-    }
-
-    # Remove the previous content of this storage slot, independent of any
-    # user-assigned display name, and append the new result as the newest run.
-    history = [
-        item
-        for item in st.session_state.saved_scenarios
-        if int(item["slot_number"]) != slot_number
-    ]
-    history.append(stored_run)
-    st.session_state.saved_scenarios = history[-MAX_STORED_RUNS:]
-
-    # Comparison selection uses stable execution numbers, not editable names.
-    if "comparison_run_selection" in st.session_state:
-        valid_ids = {
-            int(item["execution_number"])
-            for item in st.session_state.saved_scenarios
-        }
-        selected = [
-            int(run_id)
-            for run_id in st.session_state.comparison_run_selection
-            if int(run_id) in valid_ids and int(run_id) != execution_number
-        ]
-        selected.append(execution_number)
-        st.session_state.comparison_run_selection = selected
-
-    return stored_run
-
-
-def sync_current_run_name_from_widget() -> None:
-    """Persist an edited current-run name before another model run starts.
-
-    This helper is intentionally called before the Run button is processed. It
-    therefore also catches a text edit when the user immediately clicks Run.
-    """
-    current = st.session_state.current_run
-    if current is None:
-        return
-
-    key = f"run_name_input_{int(current['execution_number'])}"
-    if key not in st.session_state:
-        return
-
-    proposed = str(st.session_state[key]).strip()
-    if not proposed:
-        proposed = f"run{int(current['slot_number'])}"
-
-    current["name"] = proposed
-    for item in st.session_state.saved_scenarios:
-        if int(item["execution_number"]) == int(current["execution_number"]):
-            item["name"] = proposed
-            break
-
-
-# =============================================================================
-# Session state
-# =============================================================================
-# The stored-run data schema is unchanged from v7. This revision changes only
-# diagnostic widget selection and plotting, so existing v7 runs remain usable.
-if st.session_state.get("app_state_schema_version") != APP_STATE_SCHEMA_VERSION:
-    st.session_state.saved_scenarios = []
-    st.session_state.current_run = None
-    st.session_state.total_run_count = 0
-    for key in list(st.session_state.keys()):
-        if key.startswith(("comparison_", "diagnostic_", "show_heads_", "show_flows_", "show_budget_")):
-            del st.session_state[key]
-    st.session_state.app_state_schema_version = APP_STATE_SCHEMA_VERSION
-
-if "saved_scenarios" not in st.session_state:
-    st.session_state.saved_scenarios = []
-
-if "current_run" not in st.session_state:
-    st.session_state.current_run = None
-
-if "total_run_count" not in st.session_state:
-    st.session_state.total_run_count = 0
-
-# Development-session migration: older versions of this app stored manually
-# named scenarios without an execution_number. Streamlit can preserve session
-# state across a source-code reload, so reset only those incompatible in-memory
-# objects rather than failing later with a KeyError.
-legacy_history = any(
-    any(key not in item for key in ("execution_number", "slot_number", "color"))
-    or int(item.get("slot_number", MAX_STORED_RUNS + 1)) > MAX_STORED_RUNS
-    for item in st.session_state.saved_scenarios
-)
-legacy_current = (
-    st.session_state.current_run is not None
-    and any(
-        key not in st.session_state.current_run
-        for key in ("execution_number", "slot_number", "color")
-    )
-)
-if legacy_history or legacy_current:
-    st.session_state.saved_scenarios = []
-    st.session_state.current_run = None
-    st.session_state.total_run_count = 0
-    if "comparison_run_selection" in st.session_state:
-        del st.session_state.comparison_run_selection
-
-
-# =============================================================================
-# User interface
-# =============================================================================
-
-# =============================================================================
-# v8 diagnostic helpers: explicit CFP boundary fluxes and node-centered tube selection
-# =============================================================================
-def selected_tube_metadata(
-    diagnostics: dict,
-    tube_number: int,
-) -> tuple[int, int, int, int, int]:
-    """Return tube index plus begin/end node indices and node numbers."""
-    tube_numbers = np.asarray(diagnostics["tube_numbers"], dtype=int)
-    matches = np.where(tube_numbers == int(tube_number))[0]
-    if matches.size != 1:
-        raise ValueError(f"CFP tube {tube_number} could not be identified uniquely.")
-    tube_idx = int(matches[0])
-    begin_node = int(np.asarray(diagnostics["tube_begin_nodes"], dtype=int)[tube_idx])
-    end_node = int(np.asarray(diagnostics["tube_end_nodes"], dtype=int)[tube_idx])
-    begin_idx, _ = selected_node_metadata(diagnostics, begin_node)
-    end_idx, _ = selected_node_metadata(diagnostics, end_node)
-    return tube_idx, begin_idx, end_idx, begin_node, end_node
-
-
-def adjacent_tubes_for_node(diagnostics: dict, node_number: int) -> dict[str, int]:
-    """Return the left/right tube connected to a conduit node.
-
-    ``Left`` and ``Right`` are defined geometrically from the x coordinate of the
-    other end node, so the UI remains correct even if CFP tube numbering changes.
-    End nodes naturally expose only one option.
-    """
-    node_idx, _ = selected_node_metadata(diagnostics, int(node_number))
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    x0 = float(node_x[node_idx])
-    begin = np.asarray(diagnostics["tube_begin_nodes"], dtype=int)
-    end = np.asarray(diagnostics["tube_end_nodes"], dtype=int)
-    tube_numbers = np.asarray(diagnostics["tube_numbers"], dtype=int)
-
-    connected = np.where((begin == int(node_number)) | (end == int(node_number)))[0]
-    if connected.size == 0:
-        raise ValueError(f"CFP node {node_number} is not connected to a conduit tube.")
-
-    choices: dict[str, int] = {}
-    for tube_idx in connected:
-        b = int(begin[tube_idx])
-        e = int(end[tube_idx])
-        other_node = e if b == int(node_number) else b
-        other_idx, _ = selected_node_metadata(diagnostics, other_node)
-        other_x = float(node_x[other_idx])
-        if other_x < x0:
-            choices["Left"] = int(tube_numbers[tube_idx])
-        elif other_x > x0:
-            choices["Right"] = int(tube_numbers[tube_idx])
-        else:
-            # The teaching network is horizontal, but retain a deterministic
-            # fallback in case a future network contains equal-x connected nodes.
-            key = "Left" if other_node < int(node_number) else "Right"
-            choices[key] = int(tube_numbers[tube_idx])
-
-    # Keep the intuitive order in radio buttons.
-    return {side: choices[side] for side in ("Left", "Right") if side in choices}
-
-
-def tube_for_node_side(diagnostics: dict, node_number: int, side: str) -> int:
-    """Return the tube number selected by node plus left/right side."""
-    choices = adjacent_tubes_for_node(diagnostics, int(node_number))
-    if side not in choices:
-        available = ", ".join(choices) or "none"
-        raise ValueError(
-            f"Node {node_number} has no {side.lower()} tube; available: {available}."
-        )
-    return int(choices[side])
-
-
-def default_tube_side(diagnostics: dict, node_number: int) -> str:
-    """Choose a stable default adjacent-tube side for a node."""
-    choices = adjacent_tubes_for_node(diagnostics, int(node_number))
-    if "Right" in choices:
-        return "Right"
-    return next(iter(choices))
-
-
-def other_end_node_for_tube(
-    diagnostics: dict,
-    tube_number: int,
-    selected_node: int,
-) -> int:
-    """Return the node at the opposite end of a tube from ``selected_node``."""
-    _, _, _, begin_node, end_node = selected_tube_metadata(diagnostics, int(tube_number))
-    if int(selected_node) == begin_node:
-        return end_node
-    if int(selected_node) == end_node:
-        return begin_node
-    raise ValueError(
-        f"Tube {tube_number} is not connected to selected node {selected_node}."
-    )
-
-
-def _tube_profile_geometry(
-    diagnostics: dict,
-    tube_number: int,
-) -> tuple[float, float, int, int]:
-    """Return distances of the two nodes connected by a selected tube."""
-    _, begin_idx, end_idx, begin_node, end_node = selected_tube_metadata(
-        diagnostics, tube_number
-    )
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    distance = node_x - node_x[0]
-    return (
-        float(distance[begin_idx]),
-        float(distance[end_idx]),
-        begin_node,
-        end_node,
-    )
-
-
+# -----------------------------------------------------------------------------
+# 4.4 Flow diagnostics
+# -----------------------------------------------------------------------------
 def _draw_tube_symbol_plan(
     ax,
     diagnostics: dict,
@@ -3142,197 +2630,6 @@ def _draw_tube_symbol_plan(
             [x1, x2], [y1, y2], s=44, marker="o", facecolors="white",
             edgecolors=color, linewidths=1.8, alpha=alpha, zorder=zorder + 1,
         )
-
-
-def _draw_tube_symbol_profile(
-    ax,
-    diagnostics: dict,
-    tube_number: int,
-    y1: float,
-    y2: float,
-    color: str,
-    label: str,
-    y_span: float,
-    selected_node: int | None = None,
-    selected_fill_color: str | None = None,
-    linestyle: str = "-",
-    alpha: float = 1.0,
-    zorder: int = 10,
-):
-    """Draw a tube between its two nodes in a longitudinal profile."""
-    x1, x2, begin_node, end_node = _tube_profile_geometry(diagnostics, tube_number)
-    offset = max(abs(float(y_span)) * 0.006, 1.0e-10)
-    ax.plot(
-        [x1, x2], [y1 + offset, y2 + offset],
-        color=color, linewidth=2.0, linestyle=linestyle, alpha=alpha,
-        label=label, zorder=zorder,
-    )
-    ax.plot(
-        [x1, x2], [y1 - offset, y2 - offset],
-        color=color, linewidth=2.0, linestyle=linestyle, alpha=alpha,
-        zorder=zorder,
-    )
-
-    if selected_node is not None and int(selected_node) in (begin_node, end_node):
-        if int(selected_node) == begin_node:
-            sx, sy, ox, oy = x1, y1, x2, y2
-        else:
-            sx, sy, ox, oy = x2, y2, x1, y1
-        ax.scatter(
-            [sx], [sy], s=55, marker="o",
-            color=(selected_fill_color or color), edgecolors="white",
-            linewidths=0.8, alpha=alpha, zorder=zorder + 2,
-        )
-        ax.scatter(
-            [ox], [oy], s=58, marker="o", facecolors="white", edgecolors=color,
-            linewidths=2.0, alpha=alpha, zorder=zorder + 2,
-        )
-    else:
-        ax.scatter(
-            [x1, x2], [y1, y2], s=42, marker="o", facecolors="white",
-            edgecolors=color, linewidths=1.7, alpha=alpha, zorder=zorder + 1,
-        )
-
-
-def _conduit_flow_profile_data(
-    diagnostics: dict,
-    time_index: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return outlet boundary, actual tube Q values, and inlet boundary as one profile."""
-    node_x = np.asarray(diagnostics["node_x"], dtype=float)
-    outlet_x = float(node_x[0])
-    inlet_x = float(node_x[-1])
-    tube_mid_x = np.asarray(diagnostics["tube_mid_x"], dtype=float)
-    tube_q = np.abs(np.asarray(diagnostics["tube_flow"][time_index, :], dtype=float))
-    spring_q = float(np.asarray(diagnostics["spring_outflow"], dtype=float)[time_index])
-    direct_q = float(
-        np.asarray(diagnostics["direct_recharge_total"], dtype=float)[time_index]
-    )
-
-    x = np.concatenate(([outlet_x], tube_mid_x, [inlet_x])) - outlet_x
-    q = np.concatenate(([spring_q], tube_q, [direct_q]))
-    return x, q
-
-
-def global_conduit_flow_max(diagnostics: dict) -> float:
-    """Maximum of actual tube flow and the two external conduit boundary fluxes."""
-    arrays = [
-        np.abs(np.asarray(diagnostics["tube_flow"], dtype=float)).ravel(),
-        np.asarray(diagnostics["spring_outflow"], dtype=float).ravel(),
-        np.asarray(diagnostics["direct_recharge_total"], dtype=float).ravel(),
-    ]
-    values = np.concatenate([a[np.isfinite(a)] for a in arrays if a.size])
-    if values.size == 0:
-        raise ValueError("The conduit-flow results contain no valid values.")
-    return float(np.max(values))
-
-
-def make_plan_view_head_plot_v7(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    selected_tube: int,
-    matrix_head_max: float,
-    comparison_node: int | None = None,
-    comparison_tube: int | None = None,
-):
-    """Plan view with node-centered tube selections."""
-    fig = make_plan_view_head_plot_v6(
-        diagnostics,
-        time_index,
-        conduit_color=conduit_color,
-        selected_node=selected_node,
-        matrix_head_max=matrix_head_max,
-        comparison_node=comparison_node,
-    )
-    ax = fig.axes[0]
-    _draw_tube_symbol_plan(
-        ax,
-        diagnostics,
-        int(selected_tube),
-        color=complementary_color(conduit_color),
-        label=f"Selected tube {selected_tube}",
-        selected_node=int(selected_node),
-    )
-    if comparison_tube is not None and int(comparison_tube) != int(selected_tube):
-        _draw_tube_symbol_plan(
-            ax,
-            diagnostics,
-            int(comparison_tube),
-            color=COMPARISON_REFERENCE_COLOR,
-            label=f"Comparison tube {comparison_tube}",
-            selected_node=(int(comparison_node) if comparison_node is not None else None),
-            linestyle="--",
-            alpha=0.9,
-        )
-    ax.legend(loc="best")
-    fig.tight_layout()
-    return fig
-
-
-def make_longitudinal_head_plot_v7(
-    diagnostics: dict,
-    time_index: int,
-    conduit_color: str,
-    selected_node: int,
-    selected_tube: int,
-    head_ylim: tuple[float, float],
-    comparison_time_index: int | None = None,
-    comparison_node: int | None = None,
-    comparison_tube: int | None = None,
-):
-    """Longitudinal head plot with node-centered selected tube(s)."""
-    fig = make_longitudinal_head_plot_v6(
-        diagnostics,
-        time_index,
-        conduit_color=conduit_color,
-        selected_node=selected_node,
-        head_ylim=head_ylim,
-        comparison_time_index=comparison_time_index,
-        comparison_node=comparison_node,
-    )
-    ax = fig.axes[0]
-    y_span = float(head_ylim[1] - head_ylim[0])
-
-    _, bidx, eidx, _, _ = selected_tube_metadata(diagnostics, int(selected_tube))
-    base_heads = np.asarray(diagnostics["conduit_heads"][time_index, :], dtype=float)
-    _draw_tube_symbol_profile(
-        ax,
-        diagnostics,
-        int(selected_tube),
-        float(base_heads[bidx]),
-        float(base_heads[eidx]),
-        color=complementary_color(conduit_color),
-        label=f"Selected tube {selected_tube}",
-        y_span=y_span,
-        selected_node=int(selected_node),
-        selected_fill_color=conduit_color,
-    )
-
-    if comparison_time_index is not None and comparison_tube is not None:
-        _, b2, e2, _, _ = selected_tube_metadata(diagnostics, int(comparison_tube))
-        comp_heads = np.asarray(
-            diagnostics["conduit_heads"][comparison_time_index, :], dtype=float
-        )
-        _draw_tube_symbol_profile(
-            ax,
-            diagnostics,
-            int(comparison_tube),
-            float(comp_heads[b2]),
-            float(comp_heads[e2]),
-            color=COMPARISON_REFERENCE_COLOR,
-            label=f"Comparison tube {comparison_tube}",
-            y_span=y_span,
-            selected_node=(int(comparison_node) if comparison_node is not None else None),
-            selected_fill_color=COMPARISON_REFERENCE_COLOR,
-            linestyle="--",
-            alpha=0.9,
-        )
-
-    ax.legend()
-    fig.tight_layout()
-    return fig
 
 
 def make_conduit_flow_profile_plot_v7(
@@ -3489,6 +2786,7 @@ def make_conduit_flow_profile_plot_v7(
     ax.legend(fontsize=8)
     fig.tight_layout()
     return fig
+
 
 def make_exchange_flow_profile_plot_v7(
     diagnostics: dict,
@@ -3653,6 +2951,53 @@ def make_tube_flow_timeseries_plot_v7(
     return fig
 
 
+def make_node_exchange_flow_timeseries_plot_v6(
+    diagnostics: dict,
+    node_number: int,
+    conduit_color: str,
+    selected_time_index: int,
+    exchange_limit: float,
+    comparison_node: int | None = None,
+    comparison_time_index: int | None = None,
+):
+    """Plot transient signed exchange at one or two selected conduit nodes."""
+    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
+    base_idx, _ = selected_node_metadata(diagnostics, node_number)
+    base = np.asarray(diagnostics["exchange_flow"][:, base_idx], dtype=float)
+    ring_color = complementary_color(conduit_color)
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.9))
+    ax.plot(times_h, base, linewidth=2.0, color=MATRIX_HEAD_COLOR,
+            label=f"Exchange — node {node_number}")
+    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
+    base_t = float(times_h[selected_time_index])
+    ax.axvline(base_t, linestyle=":", linewidth=1.4, color=ring_color, alpha=0.9)
+    ax.scatter([base_t], [float(base[selected_time_index])], s=145, facecolors="none",
+               edgecolors=ring_color, linewidths=2.4, label="Base selection", zorder=8)
+
+    if comparison_node is not None:
+        compare_idx, _ = selected_node_metadata(diagnostics, int(comparison_node))
+        compare = np.asarray(diagnostics["exchange_flow"][:, compare_idx], dtype=float)
+        ax.plot(times_h, compare, linewidth=2.0, linestyle="--", color=MATRIX_HEAD_COLOR,
+                alpha=0.62, label=f"Exchange — node {comparison_node} (comparison)")
+        if comparison_time_index is not None:
+            compare_t = float(times_h[comparison_time_index])
+            ax.axvline(compare_t, linestyle="--", linewidth=1.2,
+                       color=COMPARISON_REFERENCE_COLOR, alpha=0.8)
+            ax.scatter([compare_t], [float(compare[comparison_time_index])], s=125,
+                       marker="D", facecolors="none", edgecolors=COMPARISON_REFERENCE_COLOR,
+                       linewidths=2.2, label="Comparison selection", zorder=8)
+
+    ax.set_title("Transient matrix–conduit exchange at selected node(s)")
+    ax.set_xlabel("Time [h]")
+    ax.set_ylabel("Exchange flow [m³/s]")
+    ax.set_ylim(-float(exchange_limit), float(exchange_limit))
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
 def make_flow_profile_comparison_plots_v7(
     scenarios: list[dict],
     target_time: float,
@@ -3765,7 +3110,164 @@ def make_flow_timeseries_comparison_plots_v7(
     return fig_q, fig_ex
 
 
+# -----------------------------------------------------------------------------
+# 4.5 Cumulative water-budget plots
+# -----------------------------------------------------------------------------
+def _budget_plot_data(budget: dict) -> tuple[list[str], np.ndarray]:
+    """Return requested whole-system budget categories using a source/sink sign convention."""
+    labels = [
+        "Diffuse\nrecharge",
+        "Direct\nrecharge",
+        "Matrix storage\nchange",
+        "Matrix boundary\noutflow",
+        "Karst conduit\noutflow",
+    ]
+    # Positive = source to the combined matrix/conduit system. A positive matrix
+    # storage change means water was accumulated in matrix storage and is therefore
+    # shown as a sink (negative plotted value). Storage release appears positive.
+    values = np.asarray(
+        [
+            float(budget["diffuse_recharge"]),
+            float(budget["direct_recharge"]),
+            -float(budget["matrix_storage_change"]),
+            -float(budget["matrix_boundary_outflow"]),
+            -float(budget["karst_conduit_outflow"]),
+        ],
+        dtype=float,
+    )
+    return labels, values
 
+
+def make_cumulative_budget_plot(run: dict):
+    """Plot the requested cumulative whole-run budget for one model execution."""
+    budget = run.get("budget")
+    if budget is None:
+        raise ValueError("No cumulative budget is available for this run.")
+    labels, values = _budget_plot_data(budget)
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.1))
+    x = np.arange(len(labels))
+    bars = ax.bar(x, values, width=0.68, color=run["color"], alpha=0.88)
+    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Cumulative water volume [m³]")
+    ax.set_title("Cumulative water budget — complete simulation")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    finite = values[np.isfinite(values)]
+    if finite.size:
+        span = max(float(np.max(np.abs(finite))), 1.0)
+        offset = 0.018 * span
+        for bar, value in zip(bars, values):
+            va = "bottom" if value >= 0.0 else "top"
+            y = float(value + offset if value >= 0.0 else value - offset)
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                y,
+                f"{value:,.1f}",
+                ha="center",
+                va=va,
+                fontsize=8.5,
+            )
+        ax.margins(y=0.14)
+
+    fig.tight_layout()
+    return fig
+
+
+def make_budget_comparison_plot(scenarios: list[dict]):
+    """Compare cumulative whole-run budgets while retaining each run's color."""
+    if not scenarios:
+        raise ValueError("No runs were supplied for budget comparison.")
+
+    labels, _ = _budget_plot_data(scenarios[0]["budget"])
+    x = np.arange(len(labels), dtype=float)
+    n = len(scenarios)
+    width = min(0.16, 0.78 / max(n, 1))
+    offsets = (np.arange(n) - 0.5 * (n - 1)) * width
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.6))
+    for offset, scenario in zip(offsets, scenarios):
+        _, values = _budget_plot_data(scenario["budget"])
+        ax.bar(
+            x + offset,
+            values,
+            width=width,
+            color=scenario["color"],
+            alpha=0.88,
+            label=scenario["name"],
+        )
+
+    ax.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Cumulative water volume [m³]")
+    ax.set_title("Cumulative water-budget comparison")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# =============================================================================
+# 5. STREAMLIT USER INTERFACE
+# =============================================================================
+# -----------------------------------------------------------------------------
+# 5.1 Session-state initialization and migration
+# -----------------------------------------------------------------------------
+# The stored-run data schema is unchanged from v7. This revision changes only
+# diagnostic widget selection and plotting, so existing v7 runs remain usable.
+if st.session_state.get("app_state_schema_version") != APP_STATE_SCHEMA_VERSION:
+    st.session_state.saved_scenarios = []
+    st.session_state.current_run = None
+    st.session_state.total_run_count = 0
+    for key in list(st.session_state.keys()):
+        if key.startswith(("comparison_", "diagnostic_", "show_heads_", "show_flows_", "show_budget_")):
+            del st.session_state[key]
+    st.session_state.app_state_schema_version = APP_STATE_SCHEMA_VERSION
+
+if "saved_scenarios" not in st.session_state:
+    st.session_state.saved_scenarios = []
+
+if "current_run" not in st.session_state:
+    st.session_state.current_run = None
+
+if "total_run_count" not in st.session_state:
+    st.session_state.total_run_count = 0
+
+# Development-session migration: older versions of this app stored manually
+# named scenarios without an execution_number. Streamlit can preserve session
+# state across a source-code reload, so reset only those incompatible in-memory
+# objects rather than failing later with a KeyError.
+legacy_history = any(
+    any(key not in item for key in ("execution_number", "slot_number", "color"))
+    or int(item.get("slot_number", MAX_STORED_RUNS + 1)) > MAX_STORED_RUNS
+    for item in st.session_state.saved_scenarios
+)
+legacy_current = (
+    st.session_state.current_run is not None
+    and any(
+        key not in st.session_state.current_run
+        for key in ("execution_number", "slot_number", "color")
+    )
+)
+if legacy_history or legacy_current:
+    st.session_state.saved_scenarios = []
+    st.session_state.current_run = None
+    st.session_state.total_run_count = 0
+    if "comparison_run_selection" in st.session_state:
+        del st.session_state.comparison_run_selection
+
+
+# =============================================================================
+# User interface
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 5.2 Model setup, parameter inputs, and model execution
+# -----------------------------------------------------------------------------
 st.title("💧 Karst Spring Response")
 st.markdown(
     "Explore how conduit and matrix properties influence the simulated spring "
@@ -3781,114 +3283,270 @@ st.caption(
     "rolling comparison history."
 )
 
-st.markdown("#### Conduit properties")
-c1, c2, c3 = st.columns(3)
+# One central input-mode toggle controls all numerical model inputs. The mode is
+# intentionally not part of the model parameter fingerprint: switching between
+# slider and number input must preserve the represented values and the current run.
+INPUT_MODE_KEY = "model_use_number_inputs"
+use_number_inputs = st.toggle(
+    "Use number inputs",
+    value=False,
+    key=INPUT_MODE_KEY,
+    help=(
+        "Switch all numerical model controls between sliders and direct number "
+        "inputs. Existing values are preserved when the input mode changes."
+    ),
+)
+st.caption(
+    "Input mode: **number inputs**" if use_number_inputs else "Input mode: **sliders**"
+)
 
-with c1:
-    dmt = st.slider(
-        "Conduit diameter, d [m]",
-        min_value=0.02,
-        max_value=1.00,
-        value=0.30,
-        step=0.01,
-    )
-    trtst = st.slider(
-        "Tortuosity [-]",
-        min_value=1.0,
-        max_value=3.0,
-        value=1.0,
-        step=0.05,
-    )
+# Relative roughness k/D is the canonical conduit-roughness value.  Absolute
+# roughness k is only an alternative UI representation.  Therefore changing
+# conduit diameter preserves k/D and updates k = (k/D) * D.
+# The relative-roughness range is fixed and independent of conduit diameter;
+# the available absolute-roughness range scales with the current diameter.
+ROUGHNESS_ABS_STATE_KEY = "roughness_absolute__value"
+ROUGHNESS_REL_STATE_KEY = "roughness_relative__value"
+ROUGHNESS_MODE_KEY = "conduit_use_absolute_roughness"
+ROUGHNESS_PREVIOUS_MODE_KEY = "conduit_use_absolute_roughness_previous_mode"
+ROUGHNESS_PREVIOUS_DIAMETER_KEY = "conduit_roughness_previous_diameter"
+ROUGHNESS_RELATIVE_MIN = 1.0e-7
+ROUGHNESS_RELATIVE_MAX = 1.25
 
-with c2:
-    rh = st.slider(
-        "Roughness height [m]",
-        min_value=0.0,
-        max_value=0.20,
-        value=0.03,
-        step=0.005,
-    )
-    cfptemp = st.slider(
-        "Water temperature [°C]",
-        min_value=5.0,
-        max_value=30.0,
-        value=10.0,
-        step=1.0,
-    )
+# Fresh-session defaults: d = 0.30 m, k/D = 0.10, hence k = 0.03 m.
+# Relative roughness is the initial UI representation (toggle off).
+st.session_state.setdefault(ROUGHNESS_MODE_KEY, False)
+st.session_state.setdefault(ROUGHNESS_REL_STATE_KEY, 0.10)
+st.session_state.setdefault(ROUGHNESS_ABS_STATE_KEY, 0.03)
+st.session_state.setdefault(ROUGHNESS_PREVIOUS_MODE_KEY, False)
+st.session_state.setdefault(ROUGHNESS_PREVIOUS_DIAMETER_KEY, 0.30)
 
-with c3:
-    laminar_only = st.toggle(
-        "Laminar only",
-        value=False,
-        help=(
-            "When enabled, the critical Reynolds-number controls are locked and "
-            "CFP receives both transition thresholds multiplied by 10,000. This "
-            "keeps the modeled conduit in the laminar regime over a much wider "
-            "range of simulated velocities."
-        ),
-    )
-    lcrey = st.slider(
-        "Lower critical Reynolds number [-]",
-        min_value=100,
-        max_value=3000,
-        value=500,
-        step=50,
-        disabled=laminar_only,
-    )
-    hcrey = st.slider(
-        "Higher critical Reynolds number [-]",
-        min_value=1000,
-        max_value=10000,
-        value=5000,
-        step=100,
-        disabled=laminar_only,
-    )
-    if laminar_only:
-        st.caption(
-            f"Effective CFP thresholds: Re₁ = {int(lcrey * 10000):,}, "
-            f"Re₂ = {int(hcrey * 10000):,}."
+with st.expander("Conduit properties", expanded=True):
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        dmt = synced_numeric_input(
+            "Conduit diameter, d [m]",
+            base_key="conduit_diameter",
+            minimum=0.02,
+            maximum=1.00,
+            default=0.30,
+            step=0.01,
+            number_mode=use_number_inputs,
+            format_string="%.2f",
+        )
+        trtst = synced_numeric_input(
+            "Tortuosity [-]",
+            base_key="conduit_tortuosity",
+            minimum=1.0,
+            maximum=3.0,
+            default=1.0,
+            step=0.05,
+            number_mode=use_number_inputs,
+            format_string="%.2f",
         )
 
-st.markdown("#### Matrix, exchange and storage")
-c4, c5, c6 = st.columns(3)
+    with c2:
+        st.markdown("**Roughness input: relative k/D ↔ absolute k**")
+        use_absolute_roughness = st.toggle(
+            "Use absolute k",
+            key=ROUGHNESS_MODE_KEY,
+            help=(
+                "Off: enter relative roughness k/D. On: enter absolute roughness "
+                "height k [m]. Relative roughness is the underlying value, so "
+                "changing conduit diameter preserves k/D and adjusts k."
+            ),
+        )
 
-with c4:
-    log_kxch = st.slider(
-        "log₁₀ conduit wall permeability [m/s]",
-        min_value=-8.0,
-        max_value=-2.0,
-        value=float(np.log10(4e-5)),
-        step=0.01,
-    )
-    kxch = 10.0**log_kxch
-    st.caption(f"kₓch = {kxch:.2e} m/s")
+        previous_roughness_mode = bool(
+            st.session_state.get(ROUGHNESS_PREVIOUS_MODE_KEY, False)
+        )
+        previous_roughness_diameter = float(
+            st.session_state.get(ROUGHNESS_PREVIOUS_DIAMETER_KEY, 0.30)
+        )
+        roughness_mode_changed = (
+            bool(use_absolute_roughness) != previous_roughness_mode
+        )
+        roughness_diameter_changed = not np.isclose(
+            float(dmt),
+            previous_roughness_diameter,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
 
-with c5:
-    log_hk = st.slider(
-        "log₁₀ matrix hydraulic conductivity [m/s]",
-        min_value=-8.0,
-        max_value=-2.0,
-        value=-4.0,
-        step=0.01,
-    )
-    hk = 10.0**log_hk
-    st.caption(f"K = {hk:.2e} m/s")
+        # k/D is the canonical roughness state.  Clamp any legacy session value
+        # once to the fixed relative-roughness range.
+        roughness_rel = _clip_numeric(
+            st.session_state.get(ROUGHNESS_REL_STATE_KEY, 0.10),
+            ROUGHNESS_RELATIVE_MIN,
+            ROUGHNESS_RELATIVE_MAX,
+        )
+        st.session_state[ROUGHNESS_REL_STATE_KEY] = roughness_rel
 
-with c6:
-    sy = st.slider(
-        "Matrix specific yield, Sy [-]",
-        min_value=0.001,
-        max_value=0.40,
-        value=0.05,
-        step=0.001,
-    )
-    CADS = st.slider(
-        "Conduit associated storage (CADS)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.0,
-        step=0.01,
-    )
+        if use_absolute_roughness:
+            # Absolute roughness is a diameter-dependent view of canonical k/D.
+            # A diameter or representation change refreshes the widget from k/D;
+            # a direct user edit of k is converted back to the canonical k/D.
+            absolute_min = ROUGHNESS_RELATIVE_MIN * float(dmt)
+            absolute_max = ROUGHNESS_RELATIVE_MAX * float(dmt)
+
+            if roughness_mode_changed or roughness_diameter_changed:
+                st.session_state[ROUGHNESS_ABS_STATE_KEY] = (
+                    roughness_rel * float(dmt)
+                )
+
+            rh = synced_numeric_input(
+                "Absolute roughness, k [m]",
+                base_key="roughness_absolute",
+                minimum=absolute_min,
+                maximum=absolute_max,
+                default=0.10 * float(dmt),
+                step=ROUGHNESS_RELATIVE_MIN * float(dmt),
+                number_mode=use_number_inputs,
+                format_string="%.7g",
+                force_sync=(roughness_mode_changed or roughness_diameter_changed),
+            )
+            roughness_rel = _clip_numeric(
+                float(rh) / max(float(dmt), 1.0e-12),
+                ROUGHNESS_RELATIVE_MIN,
+                ROUGHNESS_RELATIVE_MAX,
+            )
+            rh = roughness_rel * float(dmt)
+            st.session_state[ROUGHNESS_REL_STATE_KEY] = roughness_rel
+            st.session_state[ROUGHNESS_ABS_STATE_KEY] = rh
+            st.caption(f"Equivalent relative roughness: k/D = {roughness_rel:.4g}")
+
+        else:
+            # Relative mode displays the canonical value directly.  Its slider
+            # range is fixed, and a diameter change deliberately does not refresh
+            # or move this widget.  Only the derived absolute roughness changes.
+            relative_roughness = synced_numeric_input(
+                "Relative roughness, k/D [-]",
+                base_key="roughness_relative",
+                minimum=ROUGHNESS_RELATIVE_MIN,
+                maximum=ROUGHNESS_RELATIVE_MAX,
+                default=0.10,
+                step=ROUGHNESS_RELATIVE_MIN,
+                number_mode=use_number_inputs,
+                format_string="%.4g",
+                force_sync=roughness_mode_changed,
+            )
+            roughness_rel = _clip_numeric(
+                float(relative_roughness),
+                ROUGHNESS_RELATIVE_MIN,
+                ROUGHNESS_RELATIVE_MAX,
+            )
+            rh = roughness_rel * float(dmt)
+            st.session_state[ROUGHNESS_REL_STATE_KEY] = roughness_rel
+            st.session_state[ROUGHNESS_ABS_STATE_KEY] = rh
+            st.caption(f"Equivalent roughness height: k = {rh:.7g} m")
+
+        # These are UI-state trackers only; neither is a model parameter.
+        st.session_state[ROUGHNESS_PREVIOUS_MODE_KEY] = bool(use_absolute_roughness)
+        st.session_state[ROUGHNESS_PREVIOUS_DIAMETER_KEY] = float(dmt)
+
+        cfptemp = synced_numeric_input(
+            "Water temperature [°C]",
+            base_key="water_temperature",
+            minimum=0.0,
+            maximum=30.0,
+            default=10.0,
+            step=1.0,
+            number_mode=use_number_inputs,
+            format_string="%.0f",
+        )
+
+    with c3:
+        laminar_only = st.toggle(
+            "Laminar only",
+            value=False,
+            help=(
+                "When enabled, the critical Reynolds-number controls are locked and "
+                "CFP receives both transition thresholds multiplied by 10,000. This "
+                "keeps the modeled conduit in the laminar regime over a much wider "
+                "range of simulated velocities."
+            ),
+        )
+        lcrey = synced_numeric_input(
+            "Lower critical Reynolds number [-]",
+            base_key="lower_critical_reynolds",
+            minimum=100,
+            maximum=3000,
+            default=500,
+            step=50,
+            number_mode=use_number_inputs,
+            disabled=laminar_only,
+            integer=True,
+        )
+        hcrey = synced_numeric_input(
+            "Higher critical Reynolds number [-]",
+            base_key="higher_critical_reynolds",
+            minimum=1000,
+            maximum=10000,
+            default=5000,
+            step=100,
+            number_mode=use_number_inputs,
+            disabled=laminar_only,
+            integer=True,
+        )
+        if laminar_only:
+            st.caption(
+                f"Effective CFP thresholds: Re₁ = {int(lcrey * 10000):,}, "
+                f"Re₂ = {int(hcrey * 10000):,}."
+            )
+
+with st.expander("Matrix, exchange and storage", expanded=True):
+    c4, c5, c6 = st.columns(3)
+
+    with c4:
+        kxch = parameter_input(
+            "Conduit wall permeability [m/s]",
+            key="conduit_wall_permeability",
+            default=4.0e-5,
+            min_value=1.0e-8,
+            max_value=1.0e-2,
+            scale="log",
+            use_number_input=use_number_inputs,
+            number_format="%.2e",
+            log_steps_per_decade=20,
+        )
+        st.caption(f"kₓch = {kxch:.2e} m/s")
+
+    with c5:
+        hk = parameter_input(
+            "Matrix hydraulic conductivity [m/s]",
+            key="matrix_hydraulic_conductivity",
+            default=1.0e-4,
+            min_value=1.0e-8,
+            max_value=1.0e-2,
+            scale="log",
+            use_number_input=use_number_inputs,
+            number_format="%.2e",
+            log_steps_per_decade=20,
+        )
+        st.caption(f"K = {hk:.2e} m/s")
+
+    with c6:
+        sy = synced_numeric_input(
+            "Matrix specific yield, Sy [-]",
+            base_key="matrix_specific_yield",
+            minimum=0.001,
+            maximum=0.40,
+            default=0.05,
+            step=0.001,
+            number_mode=use_number_inputs,
+            format_string="%.3f",
+        )
+        CADS = synced_numeric_input(
+            "Conduit associated storage (CADS)",
+            base_key="conduit_associated_storage",
+            minimum=0.0,
+            maximum=1.0,
+            default=0.0,
+            step=0.01,
+            number_mode=use_number_inputs,
+            format_string="%.2f",
+        )
 
 params = {
     "dmt": dmt,
@@ -3956,7 +3614,9 @@ if run_model:
 
 
 # =============================================================================
-# Current result
+# -----------------------------------------------------------------------------
+# 5.3 Current result and optional diagnostics
+# -----------------------------------------------------------------------------
 # =============================================================================
 if st.session_state.current_run is not None:
     current = st.session_state.current_run
@@ -4647,6 +4307,9 @@ if st.session_state.current_run is not None:
 # =============================================================================
 # Comparison section
 # =============================================================================
+# -----------------------------------------------------------------------------
+# 5.4 Stored-run comparison
+# -----------------------------------------------------------------------------
 st.divider()
 st.header("2. Compare stored runs")
 
