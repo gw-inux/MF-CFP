@@ -3347,12 +3347,12 @@ with st.expander("Conduit properties", expanded=True):
         )
 
     with c2:
-        st.markdown("**Roughness input: relative k/D ↔ absolute k**")
+        st.markdown("Roughness input: rel. k/d or absolute k")
         use_absolute_roughness = st.toggle(
             "Use absolute k",
             key=ROUGHNESS_MODE_KEY,
             help=(
-                "Off: enter relative roughness k/D. On: enter absolute roughness "
+                "Off: enter relative roughness k/d. On: enter absolute roughness "
                 "height k [m]. Relative roughness is the underlying value, so "
                 "changing conduit diameter preserves k/D and adjusts k."
             ),
