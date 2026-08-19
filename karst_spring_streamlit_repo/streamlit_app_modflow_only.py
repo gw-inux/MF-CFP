@@ -30,7 +30,7 @@ Source-code overview
    5.3 Head diagnostics
    5.4 Flow diagnostics
    5.5 Water budget
-   5.6 Stored-run comparison
+   5.6 Stored-run comparison, including transient head/flow diagnostics
 
 The app deliberately does not call st.set_page_config(), so it can later be
 embedded into a multipage Streamlit application without conflicting page setup.
@@ -954,6 +954,9 @@ def clear_results_for_mode_switch() -> None:
         "mf_alt_compare_ids",
         "mf_alt_compare_budget",
         "mf_alt_steady_compare_col",
+        "mf_alt_transient_compare_time",
+        "mf_alt_transient_compare_col",
+        "mf_alt_transient_compare_plots",
     ):
         st.session_state.pop(key, None)
 
@@ -979,6 +982,27 @@ def store_run(result: dict[str, Any], parameters: dict[str, Any]) -> dict[str, A
     st.session_state.mf_alt_runs = existing[-MAX_STORED_RUNS:]
     st.session_state.mf_alt_current = run
     st.session_state.mf_alt_count = count
+
+    # Keep the comparison selection synchronized with the rolling run history.
+    # A newly completed run is always selected automatically, while runs the
+    # user deliberately deselected remain deselected. If a storage slot is
+    # overwritten, its old execution ID is removed from the widget state.
+    compare_key = "mf_alt_compare_ids"
+    valid_ids = [
+        int(item["execution_number"]) for item in st.session_state.mf_alt_runs
+    ]
+    if compare_key in st.session_state:
+        selected = [
+            int(run_id)
+            for run_id in st.session_state[compare_key]
+            if int(run_id) in valid_ids
+        ]
+    else:
+        selected = list(valid_ids)
+    if count not in selected:
+        selected.append(count)
+    st.session_state[compare_key] = selected
+
     return run
 
 
@@ -1219,18 +1243,55 @@ def plot_head_profiles(run: dict[str, Any], time_index: int, selected_col: int) 
 
 
 def plot_head_timeseries(run: dict[str, Any], selected_col: int) -> plt.Figure:
+    """Plot transient heads at the spring and a selected conduit-alignment cell."""
+
     heads = np.asarray(run["heads"], dtype=float)
-    series = heads[:, CONDUIT_ROW, selected_col]
+    selected_series = heads[:, CONDUIT_ROW, selected_col]
+    spring_series = heads[:, CONDUIT_ROW, SPRING_COL]
     fig, ax = plt.subplots(figsize=(9.5, 4.4))
+
     if run["steady_only"]:
-        ax.scatter([0.0], [series[-1]], s=70, color=run["color"])
+        ax.scatter(
+            [0.0],
+            [selected_series[-1]],
+            s=70,
+            color=run["color"],
+            label=f"Selected cell {selected_col + 1}",
+        )
+        if int(selected_col) != SPRING_COL:
+            ax.scatter(
+                [0.0],
+                [spring_series[-1]],
+                s=58,
+                marker="*",
+                color=SECONDARY_COLOR,
+                label="Spring cell",
+            )
         ax.set_xlabel("Steady state")
     else:
-        ax.plot(np.asarray(run["times"]) / 3600.0, series, lw=2.0, color=run["color"])
+        time_h = np.asarray(run["times"], dtype=float) / 3600.0
+        ax.plot(
+            time_h,
+            selected_series,
+            lw=2.0,
+            color=run["color"],
+            label=f"Selected cell {selected_col + 1}",
+        )
+        if int(selected_col) != SPRING_COL:
+            ax.plot(
+                time_h,
+                spring_series,
+                lw=1.8,
+                ls="--",
+                color=SECONDARY_COLOR,
+                label="Spring cell",
+            )
         ax.set_xlabel("Time [h]")
+
     ax.set_ylabel("Hydraulic head [m]")
     ax.set_ylim(_nice_limits(heads))
     ax.grid(True, alpha=0.3)
+    ax.legend()
     fig.tight_layout()
     return fig
 
@@ -1260,6 +1321,269 @@ def plot_drain_capture(run: dict[str, Any], time_index: int) -> plt.Figure:
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return fig
+
+
+def _selected_location_flow_series(
+    run: dict[str, Any],
+    selected_col: int,
+) -> tuple[np.ndarray, str]:
+    """Return the physically meaningful transient flow at one selected location.
+
+    For DRN runs this is local matrix-to-drain inflow at the selected DRN cell.
+    For High-K and No-conduit runs it is the MODFLOW face flow immediately
+    springward (left) of the selected cell. At the spring cell itself, the
+    boundary response is returned because no springward interior face exists.
+    """
+
+    selected_col = int(selected_col)
+
+    if run["representation"] == "Drain package":
+        local_idx = int(np.where(CONDUIT_COLS == selected_col)[0][0])
+        series = np.asarray(run["drain_cell_flux"], dtype=float)[:, local_idx]
+        if selected_col == SPRING_COL:
+            label = "Local drain inflow at spring cell (no DRN cell assigned)"
+        else:
+            label = f"Local drain inflow at cell {selected_col + 1}"
+        return series, label
+
+    if selected_col == SPRING_COL:
+        return np.asarray(run["spring_flow"], dtype=float), "Spring outflow"
+
+    face_index = selected_col - 1
+    series = np.asarray(run["conduit_face_flow"], dtype=float)[:, face_index]
+    return series, f"Face flow springward of cell {selected_col + 1}"
+
+
+def plot_flow_timeseries(run: dict[str, Any], selected_col: int) -> plt.Figure:
+    """Plot the boundary response and flow at one selected conduit location."""
+
+    time_h = np.asarray(run["times"], dtype=float) / 3600.0
+    selected_flow, selected_label = _selected_location_flow_series(run, selected_col)
+
+    if run["representation"] == "Drain package":
+        boundary_flow = np.asarray(run["drain_outflow_total"], dtype=float)
+        boundary_label = "Total drain inflow"
+    else:
+        boundary_flow = np.asarray(run["spring_flow"], dtype=float)
+        boundary_label = "Spring outflow"
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.4))
+    ax.plot(time_h, boundary_flow, lw=2.1, color=run["color"], label=boundary_label)
+
+    same_series = np.allclose(
+        np.asarray(selected_flow, dtype=float),
+        np.asarray(boundary_flow, dtype=float),
+        rtol=1e-12,
+        atol=1e-14,
+    )
+    if not same_series:
+        ax.plot(
+            time_h,
+            selected_flow,
+            lw=1.8,
+            ls="--",
+            color=SECONDARY_COLOR,
+            label=selected_label,
+        )
+
+    ax.set_xlabel("Time [h]")
+    ax.set_ylabel("Flow [m³/s]")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def _nearest_run_time_index(run: dict[str, Any], target_time: float) -> int:
+    times = np.asarray(run["times"], dtype=float)
+    return int(np.argmin(np.abs(times - float(target_time))))
+
+
+def plot_transient_head_profile_comparison(
+    runs: list[dict[str, Any]],
+    *,
+    target_time: float,
+    selected_col: int,
+) -> tuple[plt.Figure, plt.Figure]:
+    """Compare longitudinal and perpendicular transient head profiles."""
+
+    all_heads = np.concatenate(
+        [np.asarray(run["heads"], dtype=float).ravel() for run in runs]
+    )
+    hlim = _nice_limits(all_heads)
+
+    fig_long, ax_long = plt.subplots(figsize=(10.5, 4.8))
+    fig_perp, ax_perp = plt.subplots(figsize=(10.5, 4.8))
+
+    for run in runs:
+        idx = _nearest_run_time_index(run, target_time)
+        head = np.asarray(run["heads"], dtype=float)[idx]
+        x = np.asarray(run["x_centers"], dtype=float)
+        y = np.asarray(run["y_centers"], dtype=float)
+        actual_time = float(np.asarray(run["times"], dtype=float)[idx])
+        label = f"{run['name']} — {actual_time / 3600.0:.3f} h"
+
+        ax_long.plot(
+            x[CONDUIT_COLS],
+            head[CONDUIT_ROW, CONDUIT_COLS],
+            lw=2.0,
+            color=run["color"],
+            label=label,
+        )
+        ax_long.scatter(
+            [x[selected_col]],
+            [head[CONDUIT_ROW, selected_col]],
+            s=42,
+            color=run["color"],
+            zorder=5,
+        )
+
+        ax_perp.plot(
+            y,
+            head[:, selected_col],
+            lw=2.0,
+            color=run["color"],
+            label=label,
+        )
+        ax_perp.scatter(
+            [y[CONDUIT_ROW]],
+            [head[CONDUIT_ROW, selected_col]],
+            s=42,
+            color=run["color"],
+            zorder=5,
+        )
+
+    if any(run["representation"] == "Drain package" for run in runs) and int(selected_col) != SPRING_COL:
+        y = np.asarray(runs[0]["y_centers"], dtype=float)
+        ax_perp.scatter(
+            [y[CONDUIT_ROW]],
+            [SPRING_HEAD],
+            marker="s",
+            s=72,
+            facecolor="white",
+            edgecolor="0.35",
+            linewidth=1.0,
+            zorder=4,
+            label="Drain elevation",
+        )
+
+    ax_long.set_xlabel("Distance along conduit alignment [m]")
+    ax_long.set_ylabel("Hydraulic head [m]")
+    ax_long.set_ylim(hlim)
+    ax_long.grid(True, alpha=0.3)
+    ax_long.legend()
+    fig_long.tight_layout()
+
+    ax_perp.set_xlabel("y [m]")
+    ax_perp.set_ylabel("Hydraulic head [m]")
+    ax_perp.set_ylim(hlim)
+    ax_perp.grid(True, alpha=0.3)
+    ax_perp.legend()
+    fig_perp.tight_layout()
+    return fig_long, fig_perp
+
+
+def plot_transient_head_timeseries_comparison(
+    runs: list[dict[str, Any]],
+    *,
+    selected_col: int,
+) -> tuple[plt.Figure, plt.Figure]:
+    """Compare transient head at the spring and at one selected location."""
+
+    all_heads = np.concatenate(
+        [np.asarray(run["heads"], dtype=float).ravel() for run in runs]
+    )
+    hlim = _nice_limits(all_heads)
+
+    fig_spring, ax_spring = plt.subplots(figsize=(10.5, 4.8))
+    fig_selected, ax_selected = plt.subplots(figsize=(10.5, 4.8))
+
+    for run in runs:
+        time_h = np.asarray(run["times"], dtype=float) / 3600.0
+        heads = np.asarray(run["heads"], dtype=float)
+        ax_spring.plot(
+            time_h,
+            heads[:, CONDUIT_ROW, SPRING_COL],
+            lw=2.0,
+            color=run["color"],
+            label=run["name"],
+        )
+        ax_selected.plot(
+            time_h,
+            heads[:, CONDUIT_ROW, selected_col],
+            lw=2.0,
+            color=run["color"],
+            label=run["name"],
+        )
+
+    ax_spring.set_xlabel("Time [h]")
+    ax_spring.set_ylabel("Hydraulic head [m]")
+    ax_spring.set_ylim(hlim)
+    ax_spring.set_title("Head over time at the spring cell")
+    ax_spring.grid(True, alpha=0.3)
+    ax_spring.legend()
+    fig_spring.tight_layout()
+
+    ax_selected.set_xlabel("Time [h]")
+    ax_selected.set_ylabel("Hydraulic head [m]")
+    ax_selected.set_ylim(hlim)
+    ax_selected.set_title(f"Head over time at conduit-alignment cell {selected_col + 1}")
+    ax_selected.grid(True, alpha=0.3)
+    ax_selected.legend()
+    fig_selected.tight_layout()
+    return fig_spring, fig_selected
+
+
+def plot_transient_flow_timeseries_comparison(
+    runs: list[dict[str, Any]],
+    *,
+    selected_col: int,
+) -> tuple[plt.Figure, plt.Figure]:
+    """Compare boundary response and selected-location transient flow."""
+
+    fig_boundary, ax_boundary = plt.subplots(figsize=(10.5, 4.8))
+    fig_selected, ax_selected = plt.subplots(figsize=(10.5, 4.8))
+
+    for run in runs:
+        time_h = np.asarray(run["times"], dtype=float) / 3600.0
+        if run["representation"] == "Drain package":
+            boundary_flow = np.asarray(run["drain_outflow_total"], dtype=float)
+            boundary_kind = "drain inflow"
+        else:
+            boundary_flow = np.asarray(run["spring_flow"], dtype=float)
+            boundary_kind = "spring outflow"
+
+        selected_flow, selected_kind = _selected_location_flow_series(run, selected_col)
+
+        ax_boundary.plot(
+            time_h,
+            boundary_flow,
+            lw=2.0,
+            color=run["color"],
+            label=f"{run['name']} — {boundary_kind}",
+        )
+        ax_selected.plot(
+            time_h,
+            selected_flow,
+            lw=2.0,
+            color=run["color"],
+            label=f"{run['name']} — {selected_kind}",
+        )
+
+    ax_boundary.set_xlabel("Time [h]")
+    ax_boundary.set_ylabel("Flow [m³/s]")
+    ax_boundary.set_title("Spring / drain response over time")
+    ax_boundary.grid(True, alpha=0.3)
+    ax_boundary.legend()
+    fig_boundary.tight_layout()
+
+    ax_selected.set_xlabel("Time [h]")
+    ax_selected.set_ylabel("Flow [m³/s]")
+    ax_selected.set_title(f"Flow at conduit-alignment location near cell {selected_col + 1}")
+    ax_selected.grid(True, alpha=0.3)
+    ax_selected.legend()
+    fig_selected.tight_layout()
+    return fig_boundary, fig_selected
 
 
 def plot_budget(run: dict[str, Any]) -> plt.Figure:
@@ -1795,7 +2119,7 @@ if current is not None:
             plt.close(fig2)
 
         if not current["steady_only"]:
-            with st.expander("Head diagnostics 3 — transient head at selected conduit-alignment cell", expanded=True):
+            with st.expander("Head diagnostics 3 — transient head at spring and selected conduit-alignment cell", expanded=True):
                 fig = plot_head_timeseries(current, selected_col)
                 st.pyplot(fig, use_container_width=True)
                 plt.close(fig)
@@ -1831,6 +2155,27 @@ if current is not None:
                     fig = plot_drain_capture(current, selected_time_index)
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
+
+            if not current["steady_only"]:
+                with st.expander(
+                    "Flow diagnostics 3 — transient flow at spring and selected location",
+                    expanded=True,
+                ):
+                    fig = plot_flow_timeseries(current, selected_col)
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+                    if current["representation"] == "Drain package":
+                        st.caption(
+                            "For DRN runs, the boundary-response curve is total drain "
+                            "inflow. The selected-location curve is the local drain "
+                            "inflow at that conduit-alignment cell."
+                        )
+                    else:
+                        st.caption(
+                            "For High-K and No-conduit runs, the selected-location curve "
+                            "is the MODFLOW face flow immediately springward of the "
+                            "selected conduit-alignment cell."
+                        )
 
     # -------------------------------------------------------------------------
     # 5.5 Water budget
@@ -1896,12 +2241,21 @@ if not runs:
 else:
     option_ids = [int(run["execution_number"]) for run in runs]
     run_by_id = {int(run["execution_number"]): run for run in runs}
-    default_ids = option_ids
+
+    # Initialize once with all retained runs. Thereafter store_run() automatically
+    # adds each new execution while respecting any older runs the user deselected.
+    if "mf_alt_compare_ids" not in st.session_state:
+        st.session_state.mf_alt_compare_ids = list(option_ids)
+    else:
+        st.session_state.mf_alt_compare_ids = [
+            int(run_id)
+            for run_id in st.session_state.mf_alt_compare_ids
+            if int(run_id) in option_ids
+        ]
 
     selected_ids = st.multiselect(
         "Runs to compare",
         options=option_ids,
-        default=default_ids,
         format_func=lambda run_id: f"{run_by_id[run_id]['name']} — {run_by_id[run_id]['representation']}",
         key="mf_alt_compare_ids",
     )
@@ -1957,6 +2311,103 @@ else:
             fig = plot_run_comparison(selected_runs)
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
+
+            with st.expander(
+                "Compare transient head and flow diagnostics",
+                expanded=False,
+            ):
+                st.caption(
+                    "The same diagnostic time and conduit-alignment cell are used for "
+                    "all selected runs. Spring/drain response follows the same "
+                    "representation-specific definition as the main comparison plot."
+                )
+
+                reference_run = selected_runs[0]
+                reference_times = np.asarray(reference_run["times"], dtype=float)
+                default_time_index = int(
+                    np.argmin(
+                        np.abs(
+                            reference_times
+                            - (1.0 + EVENT_DURATION_HOURS * 3600.0)
+                        )
+                    )
+                )
+
+                if "mf_alt_transient_compare_time" not in st.session_state:
+                    st.session_state.mf_alt_transient_compare_time = default_time_index
+                if "mf_alt_transient_compare_col" not in st.session_state:
+                    st.session_state.mf_alt_transient_compare_col = len(CONDUIT_COLS)
+
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    compare_time_index = st.select_slider(
+                        "Transient comparison time",
+                        options=list(range(len(reference_times))),
+                        format_func=lambda i: f"{reference_times[int(i)] / 3600.0:.3f} h",
+                        key="mf_alt_transient_compare_time",
+                    )
+                with tc2:
+                    compare_col_position = st.slider(
+                        "Conduit-alignment cell for transient comparison",
+                        min_value=1,
+                        max_value=len(CONDUIT_COLS),
+                        step=1,
+                        key="mf_alt_transient_compare_col",
+                    )
+                    compare_col = int(CONDUIT_COLS[int(compare_col_position) - 1])
+                    st.caption(
+                        f"Selected cell center: x = {reference_run['x_centers'][compare_col]:.0f} m, "
+                        f"row {CONDUIT_ROW + 1}, column {compare_col + 1}."
+                    )
+
+                diagnostic_options = [
+                    "Heads along and perpendicular to conduit",
+                    "Heads over time",
+                    "Flows over time",
+                ]
+                if "mf_alt_transient_compare_plots" not in st.session_state:
+                    st.session_state.mf_alt_transient_compare_plots = list(diagnostic_options)
+                chosen_diagnostics = st.multiselect(
+                    "Transient diagnostic plots",
+                    options=diagnostic_options,
+                    key="mf_alt_transient_compare_plots",
+                )
+
+                target_time = float(reference_times[int(compare_time_index)])
+
+                if "Heads along and perpendicular to conduit" in chosen_diagnostics:
+                    st.markdown("##### Compare transient head profiles")
+                    fig_long, fig_perp = plot_transient_head_profile_comparison(
+                        selected_runs,
+                        target_time=target_time,
+                        selected_col=compare_col,
+                    )
+                    st.pyplot(fig_long, use_container_width=True)
+                    plt.close(fig_long)
+                    st.pyplot(fig_perp, use_container_width=True)
+                    plt.close(fig_perp)
+
+                if "Heads over time" in chosen_diagnostics:
+                    st.markdown("##### Compare transient heads over time")
+                    fig_spring, fig_selected = plot_transient_head_timeseries_comparison(
+                        selected_runs,
+                        selected_col=compare_col,
+                    )
+                    st.pyplot(fig_spring, use_container_width=True)
+                    plt.close(fig_spring)
+                    st.pyplot(fig_selected, use_container_width=True)
+                    plt.close(fig_selected)
+
+                if "Flows over time" in chosen_diagnostics:
+                    st.markdown("##### Compare transient flows over time")
+                    fig_boundary, fig_selected = plot_transient_flow_timeseries_comparison(
+                        selected_runs,
+                        selected_col=compare_col,
+                    )
+                    st.pyplot(fig_boundary, use_container_width=True)
+                    plt.close(fig_boundary)
+                    st.pyplot(fig_selected, use_container_width=True)
+                    plt.close(fig_selected)
 
         rows = []
         for run in selected_runs:
