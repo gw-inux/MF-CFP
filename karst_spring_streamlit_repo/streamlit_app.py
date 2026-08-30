@@ -23,47 +23,47 @@ import flopy.utils.binaryfile as bf
 # =============================================================================
 # SOURCE-CODE STRUCTURE / TABLE OF CONTENTS
 # =============================================================================
-# Line numbers below refer to this v16 file. Regenerate this overview after
+# Line numbers below refer to this Reynolds-postprocessing Streamlit file. Regenerate this overview after
 # structural edits that add, remove, or move source-code blocks.
 #
 # 0. Application configuration .................................. line 70
-# 1. Model ...................................................... line 121
-#   1.1 Runtime environment and model files ..................... line 124
-#   1.2 Time discretization helper .............................. line 241
-#   1.3 MODFLOW + CFP model design and execution ................ line 255
-#     1.3.1 Initialize MODFLOW/CFP .............................. line 282
-#     1.3.2 Continuum characteristics ........................... line 291
-#     1.3.3 Time discretization ................................. line 319
-#     1.3.4 Boundary and initial conditions ..................... line 338
-#     1.3.5 MODFLOW packages .................................... line 352
-#     1.3.6 CFP solver variables ................................ line 419
-#     1.3.7 CFP conduit-network construction .................... line 428
-#     1.3.8 CFP pipe data ....................................... line 456
-#     1.3.9 CFP node and exchange data .......................... line 476
-#     1.3.10 CFP package and input files ........................ line 490
-#     1.3.11 Execute CFP/MODFLOW ................................ line 550
-#     1.3.12 External conduit boundary fluxes ................... line 561
-#     1.3.13 Cumulative whole-run water budget .................. line 623
-#     1.3.14 Head and flow diagnostics .......................... line 637
-# 2. Model output and post-processing ........................... line 678
-#   2.1 Cumulative water-budget parsing ......................... line 681
-#   2.2 CFP listing-file parsing ................................ line 809
-#   2.3 MODFLOW matrix-head output and diagnostic assembly ...... line 1157
-# 3. User input, run state, and diagnostic selection ............ line 1284
-#   3.1 Synchronized numerical-input helpers .................... line 1287
-#   3.2 Stored-run data and rolling history ..................... line 1574
-#   3.3 Diagnostic node/tube selection and geometry ............. line 1686
-# 4. Plotting and diagnostic visualization ...................... line 1782
-#   4.1 Common plotting, scale, and formatting helpers .......... line 1785
-#   4.2 Spring-response comparison .............................. line 2025
-#   4.3 Head diagnostics ........................................ line 2069
-#   4.4 Flow diagnostics ........................................ line 2575
-#   4.5 Cumulative water-budget plots ........................... line 3114
-# 5. Streamlit user interface ................................... line 3214
-#   5.1 Session-state initialization and migration .............. line 3217
-#   5.2 Model setup, parameter inputs, and model execution ...... line 3269
-#   5.3 Current result and optional diagnostics ................. line 3618
-#   5.4 Stored-run comparison ................................... line 4311
+# 1. Model ...................................................... line 130
+#   1.1 Runtime environment and model files ..................... line 133
+#   1.2 Time discretization helper .............................. line 250
+#   1.3 MODFLOW + CFP model design and execution ................ line 264
+#     1.3.1 Initialize MODFLOW/CFP .............................. line 291
+#     1.3.2 Continuum characteristics ........................... line 300
+#     1.3.3 Time discretization ................................. line 328
+#     1.3.4 Boundary and initial conditions ..................... line 347
+#     1.3.5 MODFLOW packages .................................... line 361
+#     1.3.6 CFP solver variables ................................ line 428
+#     1.3.7 CFP conduit-network construction .................... line 437
+#     1.3.8 CFP pipe data ....................................... line 465
+#     1.3.9 CFP node and exchange data .......................... line 485
+#     1.3.10 CFP package and input files ........................ line 499
+#     1.3.11 Execute CFP/MODFLOW ................................ line 559
+#     1.3.12 External conduit boundary fluxes ................... line 570
+#     1.3.13 Cumulative whole-run water budget .................. line 632
+#     1.3.14 Head and flow diagnostics .......................... line 646
+# 2. Model output and post-processing ........................... line 687
+#   2.1 Cumulative water-budget parsing ......................... line 690
+#   2.2 CFP listing-file parsing ................................ line 818
+#   2.3 MODFLOW matrix-head output and diagnostic assembly ...... line 1186
+# 3. User input, run state, and diagnostic selection ............ line 1313
+#   3.1 Synchronized numerical-input helpers .................... line 1316
+#   3.2 Stored-run data and rolling history ..................... line 1603
+#   3.3 Diagnostic node/tube selection and geometry ............. line 1715
+# 4. Plotting and diagnostic visualization ...................... line 1811
+#   4.1 Common plotting, scale, and formatting helpers .......... line 1814
+#   4.2 Spring-response comparison .............................. line 2054
+#   4.3 Head diagnostics ........................................ line 2098
+#   4.4 Flow diagnostics ........................................ line 2604
+#   4.5 Cumulative water-budget plots ........................... line 3515
+# 5. Streamlit user interface ................................... line 3615
+#   5.1 Session-state initialization and migration .............. line 3618
+#   5.2 Model setup, parameter inputs, and model execution ...... line 3670
+#   5.3 Current result and optional diagnostics ................. line 4019
+#   5.4 Stored-run comparison ................................... line 4767
 
 
 # =============================================================================
@@ -95,13 +95,22 @@ REFERENCE_COLOR = "#555555"
 COMPARISON_REFERENCE_COLOR = "#a65628"
 HEAD_COLORMAP = "viridis"
 
+# CFP FLOW-state colors are used only in Reynolds-number post-processing.
+# The FLOW state itself is read directly from the CFP tube-result table and is
+# never inferred here or fed back into the numerical model.
+LAMINAR_FLOW_COLOR = "#55a868"
+TURBULENT_FLOW_COLOR = "#dd8452"
+UNKNOWN_FLOW_COLOR = "#777777"
+
 # CFP output marker used in the listing file.
 FLOW_RESULTS_MARKER = "RESULTS OF FLOW CALCULATION"
 
 # Generic Fortran/decimal number pattern. D exponents are converted to E later.
 _NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?"
 _TUBE_RESULT_RE = re.compile(
-    rf"^\s*(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+({_NUMBER})(?:\s|$)",
+    rf"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+"
+    rf"({_NUMBER})\s+({_NUMBER})\s+({_NUMBER})\s+({_NUMBER})"
+    rf"(?:\s+({_NUMBER}))?(?:\s|$)",
     re.IGNORECASE,
 )
 _NODE_COORD_RE = re.compile(
@@ -869,7 +878,8 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
     * signed matrix-conduit ``EXCHANGE`` at each node;
     * ``DIRECT RECHARGE`` at each node (external conduit inflow);
     * ``QFIX`` at each node (fixed-head boundary flow; negative is spring outflow);
-    * actual tube ``Q`` between each pair of connected conduit nodes.
+    * actual tube ``Q`` between each pair of connected conduit nodes;
+    * CFP-reported tube Reynolds number ``RE`` and FLOW state (laminar/turbulent).
 
     Tube Q is therefore *not* used as a substitute for sinkhole inflow or spring
     outflow. Those boundary fluxes come directly from the node table.
@@ -981,16 +991,28 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
                 )
 
             i += 1
-            tube_rows_result: list[tuple[int, int, int, float]] = []
+            # Tuple layout deliberately keeps Q at index 3 for backward
+            # compatibility with the established post-processing code:
+            # (tube, begin node, end node, Q, normalized FLOW state, RE).
+            tube_rows_result: list[tuple[int, int, int, float, str, float]] = []
             while i < len(lines):
                 match = _TUBE_RESULT_RE.match(lines[i])
                 if match:
+                    raw_state = str(match.group(4)).strip().upper()
+                    if raw_state.startswith("LAM"):
+                        flow_state = "laminar"
+                    elif raw_state.startswith("TURB"):
+                        flow_state = "turbulent"
+                    else:
+                        flow_state = "unknown"
                     tube_rows_result.append(
                         (
                             int(match.group(1)),
                             int(match.group(2)),
                             int(match.group(3)),
-                            _as_float(match.group(4)),
+                            _as_float(match.group(5)),  # Q [m3/s]
+                            flow_state,
+                            _as_float(match.group(8)),  # CFP-reported Reynolds number
                         )
                     )
                     i += 1
@@ -1043,6 +1065,8 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
     direct_recharge = np.empty_like(conduit_heads)
     qfix = np.empty_like(conduit_heads)
     tube_flow = np.empty((n_time, len(tube_numbers)), dtype=float)
+    tube_reynolds = np.empty_like(tube_flow)
+    tube_flow_state = np.empty(tube_flow.shape, dtype="<U10")
     stress_periods = np.empty(n_time, dtype=int)
     time_steps = np.empty(n_time, dtype=int)
 
@@ -1070,6 +1094,8 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
         direct_recharge[block_idx, :] = [r[4] for r in node_rows_result]
         qfix[block_idx, :] = [r[5] for r in node_rows_result]
         tube_flow[block_idx, :] = [r[3] for r in tube_rows_result]
+        tube_flow_state[block_idx, :] = [r[4] for r in tube_rows_result]
+        tube_reynolds[block_idx, :] = [r[5] for r in tube_rows_result]
         stress_periods[block_idx] = int(block["stress_period"] or -1)
         time_steps[block_idx] = int(block["time_step"] or -1)
 
@@ -1147,10 +1173,13 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
         "tube_end_nodes": tube_end_nodes,
         "tube_flow": tube_flow,
         "tube_flow_magnitude": np.abs(tube_flow),
+        "tube_reynolds": tube_reynolds,
+        "tube_flow_state": tube_flow_state,
         "tube_mid_x": tube_mid_x,
         "tube_mid_y": tube_mid_y,
         "node_conduit_flow": node_conduit_flow,
     }
+
 
 
 # -----------------------------------------------------------------------------
@@ -2632,6 +2661,278 @@ def _draw_tube_symbol_plan(
         )
 
 
+def _flow_state_style(state: str) -> tuple[str, str, str]:
+    """Return color, marker, and label for a normalized CFP tube-flow state."""
+    normalized = str(state).strip().lower()
+    if normalized == "laminar":
+        return LAMINAR_FLOW_COLOR, "o", "Laminar"
+    if normalized == "turbulent":
+        return TURBULENT_FLOW_COLOR, "s", "Turbulent"
+    return UNKNOWN_FLOW_COLOR, "D", "Unknown flow state"
+
+def _add_flow_state_legend_entries(ax, states: np.ndarray) -> None:
+    """Add at most one legend entry per CFP flow state present in ``states``."""
+    normalized = np.asarray(states, dtype=str).ravel()
+    for state in ("laminar", "turbulent", "unknown"):
+        if np.any(normalized == state):
+            color, marker, label = _flow_state_style(state)
+            ax.scatter(
+                [], [], marker=marker, s=34, color=color,
+                edgecolors="white", linewidths=0.6, label=label,
+            )
+
+def _plot_cfp_state_colored_series(
+    ax,
+    x: np.ndarray,
+    y: np.ndarray,
+    states: np.ndarray,
+    *,
+    linestyle: str = "-",
+    linewidth: float = 2.1,
+    alpha: float = 1.0,
+    series_label: str | None = None,
+    markersize: float = 18.0,
+) -> None:
+    """Plot a time series with line color and marker determined by CFP FLOW state."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    states = np.asarray(states, dtype=str)
+    if x.shape != y.shape or x.shape != states.shape:
+        raise ValueError("Flow-state time-series arrays must have matching shapes.")
+
+    if series_label:
+        ax.plot(
+            [], [], color=REFERENCE_COLOR, linestyle=linestyle,
+            linewidth=linewidth, alpha=alpha, label=series_label,
+        )
+
+    n = len(x)
+    start = 0
+    while start < n:
+        state = states[start]
+        end = start + 1
+        while end < n and states[end] == state:
+            end += 1
+        color, _, _ = _flow_state_style(state)
+        # Include the preceding point at a transition so the colored pieces meet.
+        seg_start = max(0, start - 1) if start > 0 else start
+        ax.plot(
+            x[seg_start:end], y[seg_start:end],
+            color=color, linestyle=linestyle, linewidth=linewidth,
+            alpha=alpha, zorder=3,
+        )
+        start = end
+
+    for state in ("laminar", "turbulent", "unknown"):
+        mask = states == state
+        if not np.any(mask):
+            continue
+        color, marker, _ = _flow_state_style(state)
+        ax.scatter(
+            x[mask], y[mask], marker=marker, s=markersize,
+            color=color, edgecolors="white", linewidths=0.35,
+            alpha=min(1.0, alpha), zorder=4,
+        )
+
+def _effective_cfp_reynolds_thresholds(params: dict) -> tuple[float, float]:
+    """Return the Reynolds thresholds actually written to CFP for one run."""
+    multiplier = 10000.0 if bool(params.get("laminar_only", False)) else 1.0
+    return (
+        float(params["lcrey"]) * multiplier,
+        float(params["hcrey"]) * multiplier,
+    )
+
+def make_tube_reynolds_profile_plot_v17(
+    diagnostics: dict,
+    time_index: int,
+    conduit_color: str,
+    selected_tube: int,
+    lower_critical_re: float,
+    upper_critical_re: float,
+    comparison_time_index: int | None = None,
+    comparison_tube: int | None = None,
+):
+    """Plot CFP-reported Reynolds number and FLOW state along all conduit tubes."""
+    if "tube_reynolds" not in diagnostics or "tube_flow_state" not in diagnostics:
+        return None
+
+    x = (
+        np.asarray(diagnostics["tube_mid_x"], dtype=float)
+        - float(np.asarray(diagnostics["node_x"], dtype=float)[0])
+    )
+    base_re = np.asarray(diagnostics["tube_reynolds"][time_index, :], dtype=float)
+    base_states = np.asarray(diagnostics["tube_flow_state"][time_index, :], dtype=str)
+    base_time = float(diagnostics["times"][time_index])
+    base_plot = np.where(base_re > 0.0, base_re, np.nan)
+    ring_color = complementary_color(conduit_color)
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.9))
+    ax.plot(
+        x, base_plot, linewidth=2.0, color=conduit_color,
+        label=f"CFP RE — {format_elapsed_time(base_time)}",
+    )
+    for state in ("laminar", "turbulent", "unknown"):
+        mask = (base_states == state) & np.isfinite(base_plot)
+        if np.any(mask):
+            color, marker, _ = _flow_state_style(state)
+            ax.scatter(
+                x[mask], base_plot[mask], marker=marker, s=34,
+                color=color, edgecolors="white", linewidths=0.45,
+                zorder=5,
+            )
+
+    tube_idx, _, _, begin_node, end_node = selected_tube_metadata(
+        diagnostics, int(selected_tube)
+    )
+    if np.isfinite(base_plot[tube_idx]):
+        _, marker, _ = _flow_state_style(base_states[tube_idx])
+        ax.scatter(
+            [float(x[tube_idx])], [float(base_plot[tube_idx])],
+            marker=marker, s=125, facecolors="none", edgecolors=ring_color,
+            linewidths=2.2, zorder=7,
+            label=f"Selected tube {selected_tube} ({begin_node}–{end_node})",
+        )
+
+    states_for_legend = [base_states]
+    if comparison_time_index is not None:
+        comp_re = np.asarray(
+            diagnostics["tube_reynolds"][comparison_time_index, :], dtype=float
+        )
+        comp_states = np.asarray(
+            diagnostics["tube_flow_state"][comparison_time_index, :], dtype=str
+        )
+        comp_plot = np.where(comp_re > 0.0, comp_re, np.nan)
+        comp_time = float(diagnostics["times"][comparison_time_index])
+        ax.plot(
+            x, comp_plot, linewidth=2.0, linestyle="--",
+            color=conduit_color, alpha=0.72,
+            label=f"CFP RE — {format_elapsed_time(comp_time)} (comparison)",
+        )
+        for state in ("laminar", "turbulent", "unknown"):
+            mask = (comp_states == state) & np.isfinite(comp_plot)
+            if np.any(mask):
+                color, marker, _ = _flow_state_style(state)
+                ax.scatter(
+                    x[mask], comp_plot[mask], marker=marker, s=30,
+                    facecolors="none", edgecolors=color, linewidths=1.2,
+                    alpha=0.9, zorder=5,
+                )
+        comp_tube = int(comparison_tube if comparison_tube is not None else selected_tube)
+        comp_idx, _, _, cb, ce = selected_tube_metadata(diagnostics, comp_tube)
+        if np.isfinite(comp_plot[comp_idx]):
+            _, comp_marker, _ = _flow_state_style(comp_states[comp_idx])
+            ax.scatter(
+                [float(x[comp_idx])], [float(comp_plot[comp_idx])],
+                marker=comp_marker, s=115, facecolors="none",
+                edgecolors=COMPARISON_REFERENCE_COLOR, linewidths=2.0,
+                zorder=7, label=f"Comparison tube {comp_tube} ({cb}–{ce})",
+            )
+        states_for_legend.append(comp_states)
+
+    ax.axhline(
+        float(lower_critical_re), linestyle=":", linewidth=1.1,
+        color=REFERENCE_COLOR, alpha=0.75, label=f"Lower critical Re = {lower_critical_re:g}",
+    )
+    ax.axhline(
+        float(upper_critical_re), linestyle="--", linewidth=1.1,
+        color=REFERENCE_COLOR, alpha=0.75, label=f"Higher critical Re = {upper_critical_re:g}",
+    )
+    _add_flow_state_legend_entries(ax, np.concatenate(states_for_legend))
+    ax.set_title("CFP Reynolds number along the conduit")
+    ax.set_xlabel("Distance along conduit from spring/outlet [m]")
+    ax.set_ylabel("Reynolds number [-]")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    return fig
+
+def make_tube_reynolds_timeseries_plot_v17(
+    diagnostics: dict,
+    tube_number: int,
+    conduit_color: str,
+    selected_time_index: int,
+    lower_critical_re: float,
+    upper_critical_re: float,
+    comparison_tube: int | None = None,
+    comparison_time_index: int | None = None,
+):
+    """Plot CFP-reported tube Reynolds number and FLOW state through time."""
+    if "tube_reynolds" not in diagnostics or "tube_flow_state" not in diagnostics:
+        return None
+
+    times_h = np.asarray(diagnostics["times"], dtype=float) / 3600.0
+    tube_idx, _, _, begin_node, end_node = selected_tube_metadata(
+        diagnostics, int(tube_number)
+    )
+    base_re = np.asarray(diagnostics["tube_reynolds"][:, tube_idx], dtype=float)
+    base_states = np.asarray(diagnostics["tube_flow_state"][:, tube_idx], dtype=str)
+    base_plot = np.where(base_re > 0.0, base_re, np.nan)
+    ring_color = complementary_color(conduit_color)
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.9))
+    _plot_cfp_state_colored_series(
+        ax, times_h, base_plot, base_states,
+        series_label=f"Tube {tube_number} ({begin_node}–{end_node})",
+    )
+    base_t = float(times_h[selected_time_index])
+    ax.axvline(base_t, linestyle=":", linewidth=1.3, color=ring_color, alpha=0.9)
+    if np.isfinite(base_plot[selected_time_index]):
+        _, marker, _ = _flow_state_style(base_states[selected_time_index])
+        ax.scatter(
+            [base_t], [float(base_plot[selected_time_index])],
+            marker=marker, s=125, facecolors="none", edgecolors=ring_color,
+            linewidths=2.2, zorder=8, label="Base diagnostic time",
+        )
+
+    states_for_legend = [base_states]
+    if comparison_tube is not None:
+        comp_idx, _, _, cb, ce = selected_tube_metadata(
+            diagnostics, int(comparison_tube)
+        )
+        comp_re = np.asarray(diagnostics["tube_reynolds"][:, comp_idx], dtype=float)
+        comp_states = np.asarray(diagnostics["tube_flow_state"][:, comp_idx], dtype=str)
+        comp_plot = np.where(comp_re > 0.0, comp_re, np.nan)
+        _plot_cfp_state_colored_series(
+            ax, times_h, comp_plot, comp_states,
+            linestyle="--", alpha=0.78,
+            series_label=f"Tube {comparison_tube} ({cb}–{ce}) — comparison",
+        )
+        if comparison_time_index is not None:
+            comp_t = float(times_h[comparison_time_index])
+            ax.axvline(
+                comp_t, linestyle="--", linewidth=1.1,
+                color=COMPARISON_REFERENCE_COLOR, alpha=0.8,
+            )
+            if np.isfinite(comp_plot[comparison_time_index]):
+                _, comp_marker, _ = _flow_state_style(comp_states[comparison_time_index])
+                ax.scatter(
+                    [comp_t], [float(comp_plot[comparison_time_index])],
+                    marker=comp_marker, s=115, facecolors="none",
+                    edgecolors=COMPARISON_REFERENCE_COLOR, linewidths=2.0,
+                    zorder=8, label="Comparison diagnostic time",
+                )
+        states_for_legend.append(comp_states)
+
+    ax.axhline(
+        float(lower_critical_re), linestyle=":", linewidth=1.1,
+        color=REFERENCE_COLOR, alpha=0.75, label=f"Lower critical Re = {lower_critical_re:g}",
+    )
+    ax.axhline(
+        float(upper_critical_re), linestyle="--", linewidth=1.1,
+        color=REFERENCE_COLOR, alpha=0.75, label=f"Higher critical Re = {upper_critical_re:g}",
+    )
+    _add_flow_state_legend_entries(ax, np.concatenate(states_for_legend))
+    ax.set_title("CFP Reynolds number in selected tube(s)")
+    ax.set_xlabel("Time [h]")
+    ax.set_ylabel("Reynolds number [-]")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
 def make_conduit_flow_profile_plot_v7(
     diagnostics: dict,
     time_index: int,
@@ -3004,10 +3305,13 @@ def make_flow_profile_comparison_plots_v7(
     node_number: int,
     tube_number: int,
 ):
-    """Compare actual conduit-flow profiles and exchange profiles across runs."""
+    """Compare conduit flow and exchange; show CFP FLOW state only in Reynolds plot."""
     labels = _scenario_labels(scenarios)
     fig_q, ax_q = plt.subplots(figsize=(9.5, 5.0))
     fig_ex, ax_ex = plt.subplots(figsize=(9.5, 5.0))
+    fig_re, ax_re = plt.subplots(figsize=(9.5, 5.0))
+    any_reynolds = False
+    reynolds_state_arrays: list[np.ndarray] = []
 
     for scenario in scenarios:
         diagnostics = scenario["diagnostics"]
@@ -3021,12 +3325,41 @@ def make_flow_profile_comparison_plots_v7(
         label = labels[int(scenario["execution_number"])]
         ax_q.plot(
             x_q, q, linewidth=2.0, marker="s", markersize=3.0,
-            color=scenario["color"], label=label
+            color=scenario["color"], label=label,
         )
         ax_ex.plot(
             node_distance, ex, linewidth=2.0, marker="o", markersize=3.0,
-            color=scenario["color"], label=label
+            color=scenario["color"], label=label,
         )
+
+        if "tube_reynolds" in diagnostics:
+            any_reynolds = True
+            re_values = np.asarray(
+                diagnostics["tube_reynolds"][idx, :], dtype=float
+            )
+            re_plot = np.where(re_values > 0.0, re_values, np.nan)
+            tube_x = (
+                np.asarray(diagnostics["tube_mid_x"], dtype=float)
+                - float(diagnostics["node_x"][0])
+            )
+            ax_re.plot(
+                tube_x, re_plot, linewidth=2.0,
+                color=scenario["color"], label=label,
+            )
+            if "tube_flow_state" in diagnostics:
+                states = np.asarray(
+                    diagnostics["tube_flow_state"][idx, :], dtype=str
+                )
+                reynolds_state_arrays.append(states)
+                for state in ("laminar", "turbulent", "unknown"):
+                    mask = (states == state) & np.isfinite(re_plot)
+                    if np.any(mask):
+                        color, marker, _ = _flow_state_style(state)
+                        ax_re.scatter(
+                            tube_x[mask], re_plot[mask], marker=marker, s=22,
+                            color=color, edgecolors="white", linewidths=0.35,
+                            alpha=0.82, zorder=5,
+                        )
 
     first_d = scenarios[0]["diagnostics"]
     node_idx, _ = selected_node_metadata(first_d, int(node_number))
@@ -3038,14 +3371,17 @@ def make_flow_profile_comparison_plots_v7(
         color=REFERENCE_COLOR,
     )
     x1, x2, b, e = _tube_profile_geometry(first_d, int(tube_number))
-    for ax in (ax_q, ax_ex):
+    for ax in (ax_q, ax_ex, ax_re):
         ax.axvspan(
             min(x1, x2), max(x1, x2),
             facecolor="none", edgecolor=REFERENCE_COLOR,
             hatch="//", linewidth=0.0, alpha=0.25,
         )
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+
+    if reynolds_state_arrays and any_reynolds:
+        combined_states = np.concatenate(reynolds_state_arrays)
+        _add_flow_state_legend_entries(ax_re, combined_states)
 
     ax_q.set_title(
         f"Stored runs — conduit flow at t = {format_elapsed_time(target_time)} "
@@ -3054,6 +3390,7 @@ def make_flow_profile_comparison_plots_v7(
     ax_q.set_xlabel("Distance along conduit from spring/outlet [m]")
     ax_q.set_ylabel("Flow [m³/s]")
     ax_q.set_ylim(bottom=0.0)
+    ax_q.legend(fontsize=8)
     fig_q.tight_layout()
 
     ax_ex.axhline(0.0, linewidth=1.0, color=REFERENCE_COLOR, alpha=0.7)
@@ -3063,8 +3400,26 @@ def make_flow_profile_comparison_plots_v7(
     )
     ax_ex.set_xlabel("Distance along conduit from spring/outlet [m]")
     ax_ex.set_ylabel("Exchange flow [m³/s]")
+    ax_ex.legend(fontsize=8)
     fig_ex.tight_layout()
-    return fig_q, fig_ex
+
+    if any_reynolds:
+        ax_re.set_title(
+            f"Stored runs — CFP Reynolds number at t = "
+            f"{format_elapsed_time(target_time)}"
+        )
+        ax_re.set_xlabel("Distance along conduit from spring/outlet [m]")
+        ax_re.set_ylabel("Reynolds number [-]")
+        ax_re.set_yscale("log")
+        ax_re.grid(True, alpha=0.3, which="both")
+        ax_re.legend(fontsize=8)
+        fig_re.tight_layout()
+    else:
+        plt.close(fig_re)
+        fig_re = None
+
+    return fig_q, fig_ex, fig_re
+
 
 
 def make_flow_timeseries_comparison_plots_v7(
@@ -3072,10 +3427,13 @@ def make_flow_timeseries_comparison_plots_v7(
     node_number: int,
     tube_number: int,
 ):
-    """Compare actual selected-tube flow and selected-node exchange across runs."""
+    """Compare tube flow and exchange; show CFP FLOW state only in Reynolds plot."""
     labels = _scenario_labels(scenarios)
     fig_q, ax_q = plt.subplots(figsize=(9.5, 5.0))
     fig_ex, ax_ex = plt.subplots(figsize=(9.5, 5.0))
+    fig_re, ax_re = plt.subplots(figsize=(9.5, 5.0))
+    any_reynolds = False
+    reynolds_state_arrays: list[np.ndarray] = []
 
     for scenario in scenarios:
         diagnostics = scenario["diagnostics"]
@@ -3089,6 +3447,35 @@ def make_flow_timeseries_comparison_plots_v7(
         label = labels[int(scenario["execution_number"])]
         ax_q.plot(times_h, q, linewidth=2.1, color=scenario["color"], label=label)
         ax_ex.plot(times_h, ex, linewidth=2.1, color=scenario["color"], label=label)
+
+        if "tube_reynolds" in diagnostics:
+            any_reynolds = True
+            re_values = np.asarray(
+                diagnostics["tube_reynolds"][:, tube_idx], dtype=float
+            )
+            re_plot = np.where(re_values > 0.0, re_values, np.nan)
+            ax_re.plot(
+                times_h, re_plot, linewidth=2.0,
+                color=scenario["color"], label=label,
+            )
+            if "tube_flow_state" in diagnostics:
+                states = np.asarray(
+                    diagnostics["tube_flow_state"][:, tube_idx], dtype=str
+                )
+                reynolds_state_arrays.append(states)
+                for state in ("laminar", "turbulent", "unknown"):
+                    mask = (states == state) & np.isfinite(re_plot)
+                    if np.any(mask):
+                        color, marker, _ = _flow_state_style(state)
+                        ax_re.scatter(
+                            times_h[mask], re_plot[mask], marker=marker, s=18,
+                            color=color, edgecolors="white", linewidths=0.3,
+                            alpha=0.72, zorder=4,
+                        )
+
+    if reynolds_state_arrays and any_reynolds:
+        combined_states = np.concatenate(reynolds_state_arrays)
+        _add_flow_state_legend_entries(ax_re, combined_states)
 
     ax_q.set_title(f"Stored runs — transient flow in tube {tube_number}")
     ax_q.set_xlabel("Time [h]")
@@ -3107,7 +3494,21 @@ def make_flow_timeseries_comparison_plots_v7(
     ax_ex.grid(True, alpha=0.3)
     ax_ex.legend(fontsize=8)
     fig_ex.tight_layout()
-    return fig_q, fig_ex
+
+    if any_reynolds:
+        ax_re.set_title(f"Stored runs — CFP Reynolds number in tube {tube_number}")
+        ax_re.set_xlabel("Time [h]")
+        ax_re.set_ylabel("Reynolds number [-]")
+        ax_re.set_yscale("log")
+        ax_re.grid(True, alpha=0.3, which="both")
+        ax_re.legend(fontsize=8)
+        fig_re.tight_layout()
+    else:
+        plt.close(fig_re)
+        fig_re = None
+
+    return fig_q, fig_ex, fig_re
+
 
 
 # -----------------------------------------------------------------------------
@@ -4179,6 +4580,9 @@ if st.session_state.current_run is not None:
             # -----------------------------------------------------------------
             if show_flow_diagnostics:
                 assert flow_max is not None and exchange_limit is not None
+                lower_critical_re, upper_critical_re = (
+                    _effective_cfp_reynolds_thresholds(current["params"])
+                )
 
                 with st.expander(
                     "Flow diagnostics — 1. Flow and exchange along the conduit",
@@ -4192,7 +4596,10 @@ if st.session_state.current_run is not None:
                         "EXCHANGE value. In the conduit-flow plot, square markers denote "
                         "tube-flow values. The active tube is connected between its two end "
                         "nodes; the selected node is filled and the opposite tube end is open. "
-                        "Exchange values are marked with circles because they belong to nodes."
+                        "Exchange values are marked with circles because they belong to nodes. "
+                        "The additional Reynolds-number plot reads CFP's RE and FLOW columns "
+                        "directly; only that Reynolds plot uses green circles for laminar flow "
+                        "and orange squares for turbulent flow. The discharge plots remain unchanged."
                     )
                     fig_flow_profile = make_conduit_flow_profile_plot_v7(
                         diagnostics,
@@ -4219,6 +4626,33 @@ if st.session_state.current_run is not None:
                     )
                     st.pyplot(fig_flow_profile, use_container_width=True)
                     plt.close(fig_flow_profile)
+
+                    fig_re_profile = make_tube_reynolds_profile_plot_v17(
+                        diagnostics,
+                        int(selected_time_index),
+                        conduit_color=conduit_color,
+                        selected_tube=int(selected_tube),
+                        lower_critical_re=float(lower_critical_re),
+                        upper_critical_re=float(upper_critical_re),
+                        comparison_time_index=(
+                            int(comparison_time_index)
+                            if comparison_mode and comparison_time_index is not None
+                            else None
+                        ),
+                        comparison_tube=(
+                            int(comparison_tube)
+                            if comparison_mode and comparison_tube is not None
+                            else None
+                        ),
+                    )
+                    if fig_re_profile is not None:
+                        st.pyplot(fig_re_profile, use_container_width=True)
+                        plt.close(fig_re_profile)
+                    else:
+                        st.caption(
+                            "CFP Reynolds-number output is unavailable for this in-memory run. "
+                            "Rerun the model with this app version to add the Reynolds diagnostic."
+                        )
 
                     fig_exchange_profile = make_exchange_flow_profile_plot_v7(
                         diagnostics,
@@ -4275,6 +4709,28 @@ if st.session_state.current_run is not None:
                     )
                     st.pyplot(fig_flow_transient, use_container_width=True)
                     plt.close(fig_flow_transient)
+
+                    fig_re_transient = make_tube_reynolds_timeseries_plot_v17(
+                        diagnostics,
+                        int(selected_tube),
+                        conduit_color=conduit_color,
+                        selected_time_index=int(selected_time_index),
+                        lower_critical_re=float(lower_critical_re),
+                        upper_critical_re=float(upper_critical_re),
+                        comparison_tube=(
+                            int(comparison_tube)
+                            if comparison_mode and comparison_tube is not None
+                            else None
+                        ),
+                        comparison_time_index=(
+                            int(comparison_time_index)
+                            if comparison_mode and comparison_time_index is not None
+                            else None
+                        ),
+                    )
+                    if fig_re_transient is not None:
+                        st.pyplot(fig_re_transient, use_container_width=True)
+                        plt.close(fig_re_transient)
 
                     fig_exchange_transient = make_node_exchange_flow_timeseries_plot_v6(
                         diagnostics,
@@ -4545,8 +5001,13 @@ else:
 
                 if "Flow and exchange along conduit" in chosen_diagnostic_plots:
                     st.markdown("##### Flow and exchange along conduit")
+                    st.caption(
+                        "A separate CFP Reynolds-number comparison is shown when available. "
+                        "Only the Reynolds plot uses green circles for laminar and orange squares "
+                        "for turbulent FLOW states; Q and exchange plots retain their existing styling."
+                    )
                     if flow_scenarios:
-                        fig_q, fig_ex = make_flow_profile_comparison_plots_v7(
+                        fig_q, fig_ex, fig_re = make_flow_profile_comparison_plots_v7(
                             flow_scenarios,
                             target_time=target_compare_time,
                             node_number=int(compare_node),
@@ -4554,6 +5015,9 @@ else:
                         )
                         st.pyplot(fig_q, use_container_width=True)
                         plt.close(fig_q)
+                        if fig_re is not None:
+                            st.pyplot(fig_re, use_container_width=True)
+                            plt.close(fig_re)
                         st.pyplot(fig_ex, use_container_width=True)
                         plt.close(fig_ex)
                     else:
@@ -4564,14 +5028,21 @@ else:
 
                 if "Transient tube flow and node exchange" in chosen_diagnostic_plots:
                     st.markdown("##### Transient tube flow and node exchange")
+                    st.caption(
+                        "A separate CFP Reynolds-number time series is shown when available. "
+                        "Laminar/turbulent symbols and colors are confined to that Reynolds plot."
+                    )
                     if flow_scenarios:
-                        fig_q, fig_ex = make_flow_timeseries_comparison_plots_v7(
+                        fig_q, fig_ex, fig_re = make_flow_timeseries_comparison_plots_v7(
                             flow_scenarios,
                             node_number=int(compare_node),
                             tube_number=int(compare_tube),
                         )
                         st.pyplot(fig_q, use_container_width=True)
                         plt.close(fig_q)
+                        if fig_re is not None:
+                            st.pyplot(fig_re, use_container_width=True)
+                            plt.close(fig_re)
                         st.pyplot(fig_ex, use_container_width=True)
                         plt.close(fig_ex)
                     else:
