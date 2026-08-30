@@ -23,47 +23,49 @@ import flopy.utils.binaryfile as bf
 # =============================================================================
 # SOURCE-CODE STRUCTURE / TABLE OF CONTENTS
 # =============================================================================
-# Line numbers below refer to this Reynolds-postprocessing Streamlit file. Regenerate this overview after
-# structural edits that add, remove, or move source-code blocks.
+# Line numbers below refer to this CADS-verified Reynolds-postprocessing
+# Streamlit file. Regenerate this overview after structural edits that add,
+# remove, or move source-code blocks.
 #
-# 0. Application configuration .................................. line 70
-# 1. Model ...................................................... line 130
-#   1.1 Runtime environment and model files ..................... line 133
-#   1.2 Time discretization helper .............................. line 250
-#   1.3 MODFLOW + CFP model design and execution ................ line 264
-#     1.3.1 Initialize MODFLOW/CFP .............................. line 291
-#     1.3.2 Continuum characteristics ........................... line 300
-#     1.3.3 Time discretization ................................. line 328
-#     1.3.4 Boundary and initial conditions ..................... line 347
-#     1.3.5 MODFLOW packages .................................... line 361
-#     1.3.6 CFP solver variables ................................ line 428
-#     1.3.7 CFP conduit-network construction .................... line 437
-#     1.3.8 CFP pipe data ....................................... line 465
-#     1.3.9 CFP node and exchange data .......................... line 485
-#     1.3.10 CFP package and input files ........................ line 499
-#     1.3.11 Execute CFP/MODFLOW ................................ line 559
-#     1.3.12 External conduit boundary fluxes ................... line 570
-#     1.3.13 Cumulative whole-run water budget .................. line 632
-#     1.3.14 Head and flow diagnostics .......................... line 646
-# 2. Model output and post-processing ........................... line 687
-#   2.1 Cumulative water-budget parsing ......................... line 690
-#   2.2 CFP listing-file parsing ................................ line 818
-#   2.3 MODFLOW matrix-head output and diagnostic assembly ...... line 1186
-# 3. User input, run state, and diagnostic selection ............ line 1313
-#   3.1 Synchronized numerical-input helpers .................... line 1316
-#   3.2 Stored-run data and rolling history ..................... line 1603
-#   3.3 Diagnostic node/tube selection and geometry ............. line 1715
-# 4. Plotting and diagnostic visualization ...................... line 1811
-#   4.1 Common plotting, scale, and formatting helpers .......... line 1814
-#   4.2 Spring-response comparison .............................. line 2054
-#   4.3 Head diagnostics ........................................ line 2098
-#   4.4 Flow diagnostics ........................................ line 2604
-#   4.5 Cumulative water-budget plots ........................... line 3515
-# 5. Streamlit user interface ................................... line 3615
-#   5.1 Session-state initialization and migration .............. line 3618
-#   5.2 Model setup, parameter inputs, and model execution ...... line 3670
-#   5.3 Current result and optional diagnostics ................. line 4019
-#   5.4 Stored-run comparison ................................... line 4767
+# 0. Application configuration .............................. line 72
+# 1. Model .................................................. line 132
+#   1.1 Runtime environment and model files ................. line 135
+#   1.1.1 CADS input construction and verification .......... line 252
+#   1.2 Time discretization helper .......................... line 340
+#   1.3 MODFLOW + CFP model design and execution ............ line 354
+#     1.3.1 Initialize MODFLOW/CFP .......................... line 381
+#     1.3.2 Continuum characteristics ....................... line 390
+#     1.3.3 Time discretization ............................. line 418
+#     1.3.4 Boundary and initial conditions ................. line 437
+#     1.3.5 MODFLOW packages ................................ line 451
+#     1.3.6 CFP solver variables ............................ line 518
+#     1.3.7 CFP conduit-network construction ................ line 527
+#     1.3.8 CFP pipe data ................................... line 555
+#     1.3.9 CFP node and exchange data ...................... line 575
+#     1.3.10 CFP package and input files .................... line 593
+#     1.3.11 Execute CFP/MODFLOW ............................ line 674
+#     1.3.12 External conduit boundary fluxes ............... line 685
+#     1.3.13 Cumulative whole-run water budget .............. line 747
+#     1.3.14 Head and flow diagnostics ...................... line 761
+# 2. Model output and post-processing ....................... line 846
+#   2.1 Cumulative water-budget parsing ..................... line 849
+#   2.2 CFP listing-file parsing ............................ line 977
+#   2.3 MODFLOW matrix-head output and diagnostic assembly .. line 1355
+# 3. User input, run state, and diagnostic selection ........ line 1482
+#   3.1 Synchronized numerical-input helpers ................ line 1485
+#   3.2 Stored-run data and rolling history ................. line 1772
+#   3.3 Diagnostic node/tube selection and geometry ......... line 1884
+# 4. Plotting and diagnostic visualization .................. line 1980
+#   4.1 Common plotting, scale, and formatting helpers ...... line 1983
+#   4.2 Spring-response comparison .......................... line 2223
+#   4.3 Head diagnostics .................................... line 2267
+#   4.4 Flow diagnostics .................................... line 2773
+#   4.5 Cumulative water-budget plots ....................... line 3684
+# 5. Streamlit user interface ............................... line 3784
+#   5.1 Session-state initialization and migration .......... line 3787
+#   5.2 Model setup, parameter inputs, and model execution .. line 3839
+#   5.3 Current result and optional diagnostics ............. line 4188
+#   5.4 Stored-run comparison ............................... line 4949
 
 
 # =============================================================================
@@ -244,6 +246,94 @@ def find_output_file(workspace: Path, preferred_name: str, suffixes: tuple[str, 
     raise FileNotFoundError(
         f"Expected output file '{preferred_name}' was not created in {workspace}."
     )
+
+
+# -----------------------------------------------------------------------------
+# 1.1.1 CADS input construction and verification
+# -----------------------------------------------------------------------------
+def build_cads_data(node_numbers, cads_width: float) -> list[float] | None:
+    """Return node-based CFP CADS widths or ``None`` when CADS is disabled.
+
+    CFPy activates CADS from the *presence* of the ``cads`` argument. Therefore
+    a zero-width list must not be passed when the user selects W_CADS = 0; the
+    correct disabled state is ``cads=None``. Positive widths are assigned
+    uniformly to all CFP nodes, as required by this teaching model.
+    """
+    width = float(cads_width)
+    if not np.isfinite(width) or width < 0.0:
+        raise ValueError("CADS width W_CADS must be a finite value >= 0.")
+    if width == 0.0:
+        return None
+    return np.full(len(node_numbers), width, dtype=float).tolist()
+
+
+def validate_cads_cfp_input(
+    cfp_data: list,
+    node_numbers,
+    cads_width: float,
+) -> None:
+    """Verify that CFPy's generated input represents the requested CADS state.
+
+    This is a pre-run safeguard only. It does not modify the CFP input.
+    """
+    lines = [str(line).strip() for line in cfp_data if str(line).strip()]
+    width = float(cads_width)
+    requested = width > 0.0
+
+    # Work from data records rather than CFPy's comment wording so this check
+    # remains robust across minor CFPy versions. For mode 1, the optional CADS
+    # keyword follows the mode record, and the node exchange/CADS records are
+    # the final nnodes data lines of the CFP input.
+    data_lines = [line for line in lines if not line.lstrip().startswith("#")]
+    if len(data_lines) < 2:
+        raise RuntimeError("CFPy returned an unexpectedly short CFP input block.")
+    optional_tokens = {token.upper() for token in data_lines[1].split()}
+    has_cads_keyword = "CADS" in optional_tokens
+    if has_cads_keyword != requested:
+        state = "enabled" if requested else "disabled"
+        raise RuntimeError(
+            f"CADS input verification failed: W_CADS={width:g} m requests CADS "
+            f"{state}, but the generated CFP optional-keyword record is "
+            f"'{data_lines[1]}'."
+        )
+
+    expected_nodes = [int(node) for node in node_numbers]
+    if len(data_lines) < len(expected_nodes):
+        raise RuntimeError(
+            "CADS input verification failed: incomplete CFP mode-1 data block."
+        )
+    node_lines = data_lines[-len(expected_nodes):]
+
+    for expected_node, line in zip(expected_nodes, node_lines):
+        parts = line.split()
+        expected_columns = 3 if requested else 2
+        if len(parts) != expected_columns:
+            raise RuntimeError(
+                "CADS input verification failed for node "
+                f"{expected_node}: expected {expected_columns} columns, got '{line}'."
+            )
+        try:
+            parsed_node = int(parts[0])
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CADS input verification failed: invalid node row '{line}'."
+            ) from exc
+        if parsed_node != expected_node:
+            raise RuntimeError(
+                "CADS input verification failed: node ordering changed in generated CFP input."
+            )
+        if requested:
+            try:
+                parsed_width = float(parts[2])
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"CADS input verification failed: invalid W_CADS in '{line}'."
+                ) from exc
+            if not np.isclose(parsed_width, width, rtol=1.0e-12, atol=0.0):
+                raise RuntimeError(
+                    "CADS input verification failed: generated W_CADS "
+                    f"{parsed_width:g} m differs from requested {width:g} m."
+                )
 
 
 # -----------------------------------------------------------------------------
@@ -493,7 +583,11 @@ def cfpy_model(
                     nbr_data[0],
                     np.ones(len(nbr_data[0])) * kxch,
                 ]
-                cads_data = (np.ones(len(nbr_data[0])) * cad).tolist()
+                # CADS is an optional CFP2 feature. CFPy activates it whenever
+                # ``cads`` is not None, so W_CADS = 0 must map to ``None`` rather
+                # than to a list of zero widths. Positive W_CADS values are
+                # assigned uniformly to all conduit nodes.
+                cads_data = build_cads_data(nbr_data[0], cad)
 
                 # -----------------------------------------------------------------
                 # 1.3.10 CFP package and input files
@@ -519,6 +613,11 @@ def cfpy_model(
                     condl_data=0,
                     cads=cads_data,
                 ).cfp()
+                validate_cads_cfp_input(
+                    cfp_data,
+                    nbr_data[0],
+                    cad,
+                )
 
                 coc_data = cfpy.coc(
                     nnodes=len(nbr_data[0]),
@@ -546,6 +645,22 @@ def cfpy_model(
                     data_strings=[coc_data, crch_data, cfp_data],
                     file_extensions=["coc", "crch", "cfp"],
                 ).write_input()
+
+                # Verify the actual file written to the temporary model workspace,
+                # not only CFPy's in-memory string list. This protects against any
+                # future change in the input writer while leaving model data intact.
+                cfp_input_file = workspace / f"{MODEL_NAME}.cfp"
+                if not cfp_input_file.exists():
+                    raise FileNotFoundError(
+                        f"Expected CFP input file was not written: {cfp_input_file}"
+                    )
+                validate_cads_cfp_input(
+                    cfp_input_file.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines(),
+                    nbr_data[0],
+                    cad,
+                )
 
                 cfpy.update_nam(
                     modelname=MODEL_NAME,
@@ -663,6 +778,44 @@ def cfpy_model(
                     # because the binary head file could not be post-processed.
                     diagnostics_error = str(exc)
 
+                # Runtime CADS verification from the CFP node-result table. These
+                # columns are output by CFP itself and provide an independent check
+                # that a positive W_CADS is actually participating in the transient
+                # calculation. Zero activity is reported as a warning, not an error,
+                # because a particular hydraulic setup could in principle produce it.
+                cad_storage_values = np.asarray(
+                    listing_results.get("cad_storage", []), dtype=float
+                )
+                cads_recharge_values = np.asarray(
+                    listing_results.get("cads_recharge", []), dtype=float
+                )
+                cads_storage_max_abs = (
+                    float(np.nanmax(np.abs(cad_storage_values)))
+                    if cad_storage_values.size else np.nan
+                )
+                cads_recharge_max_abs = (
+                    float(np.nanmax(np.abs(cads_recharge_values)))
+                    if cads_recharge_values.size else np.nan
+                )
+                cads_warning = None
+                if cad > 0.0:
+                    storage_inactive = (
+                        not np.isfinite(cads_storage_max_abs)
+                        or cads_storage_max_abs <= 1.0e-14
+                    )
+                    recharge_inactive = (
+                        not np.isfinite(cads_recharge_max_abs)
+                        or cads_recharge_max_abs <= 1.0e-14
+                    )
+                    if storage_inactive and recharge_inactive:
+                        cads_warning = (
+                            "CADS was written and verified in the CFP input, but the "
+                            "listing reports no CAD STORAGE or CADS RECHARGE activity "
+                            "during this run. Check that the deployed executable is the "
+                            "CADS-capable CFPv2 build if the hydrograph also shows no "
+                            "storage response."
+                        )
+
     return {
         "times": np.asarray(times, dtype=float),
         # ``flow`` remains the stored-run comparison alias for spring discharge.
@@ -680,6 +833,12 @@ def cfpy_model(
         "budget_error": budget_error,
         "diagnostics": diagnostics,
         "diagnostics_error": diagnostics_error,
+        "cads_enabled": bool(cad > 0.0),
+        "cads_width": float(cad),
+        "cads_input_verified": True,
+        "cads_storage_max_abs": cads_storage_max_abs,
+        "cads_recharge_max_abs": cads_recharge_max_abs,
+        "cads_warning": cads_warning,
     }
 
 
@@ -824,7 +983,7 @@ def _as_float(value: str) -> float:
 
 def _parse_cfp_node_result_line(
     line: str,
-) -> tuple[int, float, float, float, float, float] | None:
+) -> tuple[int, float, float, float, float, float, float, float] | None:
     """Parse one CFP node-result row.
 
     The node table contains an optional ``FIX`` token after NODE HEAD for a
@@ -834,6 +993,8 @@ def _parse_cfp_node_result_line(
       0 NODE HEAD
       1 MATRIX HEAD
       2 EXCHANGE
+      3 CAD STORAGE
+      4 CADS RECHARGE
       6 DIRECT RECHARGE
      12 QFIX
     """
@@ -866,6 +1027,8 @@ def _parse_cfp_node_result_line(
         values[2],   # matrix-conduit exchange
         values[6],   # direct recharge
         values[12],  # QFIX
+        values[3],   # CAD STORAGE
+        values[4],   # CADS RECHARGE
     )
 
 
@@ -956,7 +1119,7 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
 
             i += 1
             node_rows_result: list[
-                tuple[int, float, float, float, float, float]
+                tuple[int, float, float, float, float, float, float, float]
             ] = []
             while i < len(lines):
                 parsed = _parse_cfp_node_result_line(lines[i])
@@ -1064,6 +1227,8 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
     exchange_flow = np.empty_like(conduit_heads)
     direct_recharge = np.empty_like(conduit_heads)
     qfix = np.empty_like(conduit_heads)
+    cad_storage = np.empty_like(conduit_heads)
+    cads_recharge = np.empty_like(conduit_heads)
     tube_flow = np.empty((n_time, len(tube_numbers)), dtype=float)
     tube_reynolds = np.empty_like(tube_flow)
     tube_flow_state = np.empty(tube_flow.shape, dtype="<U10")
@@ -1093,6 +1258,8 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
         exchange_flow[block_idx, :] = [r[3] for r in node_rows_result]
         direct_recharge[block_idx, :] = [r[4] for r in node_rows_result]
         qfix[block_idx, :] = [r[5] for r in node_rows_result]
+        cad_storage[block_idx, :] = [r[6] for r in node_rows_result]
+        cads_recharge[block_idx, :] = [r[7] for r in node_rows_result]
         tube_flow[block_idx, :] = [r[3] for r in tube_rows_result]
         tube_flow_state[block_idx, :] = [r[4] for r in tube_rows_result]
         tube_reynolds[block_idx, :] = [r[5] for r in tube_rows_result]
@@ -1164,6 +1331,8 @@ def parse_cfp_listing(listing_file: Path, expected_times: np.ndarray) -> dict:
         "exchange_flow": exchange_flow,
         "direct_recharge": direct_recharge,
         "qfix": qfix,
+        "cad_storage": cad_storage,
+        "cads_recharge": cads_recharge,
         "direct_recharge_total": direct_recharge_total,
         "spring_outflow": spring_outflow,
         "direct_recharge_nodes": direct_nodes,
@@ -1613,7 +1782,7 @@ def parameter_table(params: dict) -> pd.DataFrame:
         "cfptemp": "Water temperature [°C]",
         "hk": "Matrix hydraulic conductivity [m/s]",
         "sy": "Matrix specific yield [-]",
-        "CADS": "CADS",
+        "CADS": "CADS width, W_CADS [m]",
         "laminar_only": "Laminar-only mode",
     }
     return pd.DataFrame(
@@ -3939,7 +4108,7 @@ with st.expander("Matrix, exchange and storage", expanded=True):
             format_string="%.3f",
         )
         CADS = synced_numeric_input(
-            "Conduit associated storage (CADS)",
+            "CADS width, W_CADS [m]",
             base_key="conduit_associated_storage",
             minimum=0.0,
             maximum=1.0,
@@ -4758,6 +4927,19 @@ if st.session_state.current_run is not None:
             use_container_width=True,
             hide_index=True,
         )
+        if current.get("cads_enabled", False):
+            st.caption(
+                "CADS input verified: "
+                f"W_CADS = {float(current.get('cads_width', 0.0)):.3g} m; "
+                "maximum |CAD STORAGE| in the CFP listing = "
+                f"{float(current.get('cads_storage_max_abs', np.nan)):.3e}; "
+                "maximum |CADS RECHARGE| = "
+                f"{float(current.get('cads_recharge_max_abs', np.nan)):.3e}."
+            )
+            if current.get("cads_warning"):
+                st.warning(current["cads_warning"])
+        else:
+            st.caption("CADS is disabled because W_CADS = 0 m.")
 
 
 # =============================================================================
